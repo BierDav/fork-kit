@@ -45,11 +45,19 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ steps.app.outputs.token }}
-      - uses: BierDav/fork-kit@SHA # vX.Y.Z
+      - id: fork-kit
+        uses: BierDav/fork-kit@SHA # vX.Y.Z
         with:
           command: sync
           token: ${{ steps.app.outputs.token }}
           allow-workflow-changes: ${{ inputs.allow-workflow-changes == true }}
+      # The machine-readable result, for dashboards, alerting or a repair agent.
+      - if: always() && steps.fork-kit.outputs.report != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-kit-result
+          path: ${{ steps.fork-kit.outputs.report }}
+          retention-days: 30
 
   # When someone other than fork-kit pushes to the sync PR, turn auto-merge off.
   guard:

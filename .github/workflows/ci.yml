@@ -11,31 +11,34 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    strategy:
-      matrix:
-        python: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          python-version: ${{ matrix.python }}
-      - run: git --version
-      - run: python -m unittest discover -s tests -v
+          bun-version: 1.4.4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: git --version && node --version && bun --version
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run lint
+      # dist/ is what the action runs: it must be exactly what the sources build.
+      - name: dist is up to date
+        run: |
+          bun run build
+          git diff --exit-code -- dist || { echo "::error::dist/ is stale; run bun run build and commit it"; exit 1; }
+      - run: bun test
 
-  lint:
+  actionlint:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: ruff
-        run: |
-          pipx run ruff==0.17.6 check .
-          pipx run ruff==0.17.6 format --check .
-      - name: actionlint
-        run: |
+      - run: |
           curl -fsSLo actionlint.tgz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
           echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tgz" | sha256sum -c -
           tar -xzf actionlint.tgz actionlint

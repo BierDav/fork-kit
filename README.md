@@ -131,14 +131,14 @@ order. Write the regex so that it excludes prereleases you don't want, e.g.
 Create a GitHub App (Settings → Developer settings → GitHub Apps) with these
 repository permissions and install it on the fork:
 
-| Permission | Why |
-|---|---|
-| Contents: read & write | push the sync branch |
-| Pull requests: read & write | open, update and label the sync PR; turn auto-merge on and off |
-| Workflows: read & write | push upstream commits that change `.github/workflows` (after review) |
-| Checks: read | read your fork branch's check runs |
-| Commit statuses: read | read your fork branch's commit statuses |
-| Actions: read | tell fork-kit's own runs apart from your checks |
+| Permission                  | Why                                                                  |
+| --------------------------- | -------------------------------------------------------------------- |
+| Contents: read & write      | push the sync branch                                                 |
+| Pull requests: read & write | open, update and label the sync PR; turn auto-merge on and off       |
+| Workflows: read & write     | push upstream commits that change `.github/workflows` (after review) |
+| Checks: read                | read your fork branch's check runs                                   |
+| Commit statuses: read       | read your fork branch's commit statuses                              |
+| Actions: read               | tell fork-kit's own runs apart from your checks                      |
 
 Store the App's ID as the repository variable `FORK_KIT_APP_ID`, and its
 private key as `FORK_KIT_APP_KEY` in the `fork-kit` environment (see
@@ -173,13 +173,13 @@ Make sure they run:
 fork-kit [--manifest PATH] [--json] [--report FILE] COMMAND
 ```
 
-| Command | What it does |
-|---|---|
-| `status` | Where the fork stands against upstream. Changes nothing. |
-| `sync [--dry-run] [--allow-workflow-changes]` | Merge the newest upstream into the sync branch and keep the PR current. |
-| `guard [--dry-run]` | Turn auto-merge off if someone other than fork-kit pushed to the sync branch. |
-| `ledger [--strict]` | List changed files no patch claims, and patches that claim no changed file (possibly upstreamed). |
-| `resolve` | Locally: check out the sync branch, merge your fork branch into it, and list conflicting files with the patches they belong to. |
+| Command                                       | What it does                                                                                                                    |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `status`                                      | Where the fork stands against upstream. Changes nothing.                                                                        |
+| `sync [--dry-run] [--allow-workflow-changes]` | Merge the newest upstream into the sync branch and keep the PR current.                                                         |
+| `guard [--dry-run]`                           | Turn auto-merge off if someone other than fork-kit pushed to the sync branch.                                                   |
+| `ledger [--strict]`                           | List changed files no patch claims, and patches that claim no changed file (possibly upstreamed).                               |
+| `resolve`                                     | Locally: check out the sync branch, merge your fork branch into it, and list conflicting files with the patches they belong to. |
 
 Exit codes:
 
@@ -187,7 +187,17 @@ Exit codes:
 - `1`: `ledger --strict` found gaps, or `resolve` left conflicts.
 - `2`: error.
 
-Needs Python ≥ 3.11, git ≥ 2.38 and full history (no shallow clone); `gh` for GitHub.
+The action runs on GitHub's own Node.js runtime and needs nothing installed
+besides git ≥ 2.38 and a full-history checkout (no shallow clone).
+
+Locally, run it from the repository with Node.js ≥ 22 or Bun:
+
+```sh
+npx --yes github:BierDav/fork-kit#v0.2.0 status
+bunx github:BierDav/fork-kit#v0.2.0 status
+```
+
+It uses `GH_TOKEN` or `GITHUB_TOKEN` when set, and `gh auth token` otherwise.
 
 ### Resolving a conflict
 
@@ -205,22 +215,23 @@ the guard still runs, because it uses `pull_request_target`.
 
 ## The result file
 
-Every command can write JSON (`--report`, uploaded as the artifact
-`fork-kit-result` by the action):
+Every command can write JSON (`--report`; the action writes
+`fork-kit-result.json` and names it in its `report` output, which the example
+workflow uploads as the artifact `fork-kit-result`):
 
 ```json
 {
   "schema": 1,
   "command": "sync",
   "outcome": "conflict",
-  "upstream": {"url": "…", "track": "branch:main", "ref": "main", "sha": "…"},
-  "fork": {"branch": "patched", "sha": "…"},
+  "upstream": { "url": "…", "track": "branch:main", "ref": "main", "sha": "…" },
+  "fork": { "branch": "patched", "sha": "…" },
   "base": "…",
   "behind": 12,
-  "conflicts": [{"path": "src/api/tags.rs", "patches": ["room-tags"]}],
+  "conflicts": [{ "path": "src/api/tags.rs", "patches": ["room-tags"] }],
   "workflow_changes": [],
-  "sync_branch": {"name": "fork-kit/sync", "sha": "…", "state": "pure"},
-  "pr": {"number": 42, "url": "…"},
+  "sync_branch": { "name": "fork-kit/sync", "sha": "…", "state": "pure" },
+  "pr": { "number": 42, "url": "…" },
   "automerge": false,
   "automerge_blocked_by": ["merge conflicts"],
   "baseline": "success",
@@ -261,6 +272,20 @@ Every command can write JSON (`--report`, uploaded as the artifact
 
 fork-kit adds the parts these leave out: one protected-branch-friendly PR flow,
 a patch ledger, and a machine-readable result per run.
+
+## Development
+
+fork-kit is TypeScript, developed with [Bun](https://bun.sh):
+
+```sh
+bun install
+bun run typecheck && bun run lint && bun test
+bun run build     # bundles src/ into dist/, which the action runs; commit it
+```
+
+The action ships as a single bundled file in `dist/` with no runtime
+dependencies. CI rebuilds it and fails if the committed bundle differs from the
+sources.
 
 ## License
 
