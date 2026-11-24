@@ -1,0 +1,76 @@
+# Copy to .github/workflows/fork-kit.yml in your fork, replace `patched` with
+# your fork branch, and pin fork-kit to a commit SHA. See the README's setup
+# and trust model: the App key belongs in the `fork-kit` environment, never in
+# repository secrets.
+name: fork-kit
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      allow-workflow-changes:
+        description: Push even though upstream changed .github/ (review those changes first)
+        type: boolean
+        default: false
+  # The guard runs the workflow as defined on the base branch and never checks
+  # out the pull request's code, so the PR's content cannot change what it does.
+  pull_request_target:
+    branches: [patched]
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  # Merge the newest upstream into the sync branch and keep the sync PR current.
+  sync:
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Holds FORK_KIT_APP_KEY. Limit its deployment branches to the default
+    # branch, so workflows running on the sync branch cannot read the key.
+    environment: fork-kit
+    permissions:
+      contents: read
+    concurrency:
+      group: fork-kit-sync
+      cancel-in-progress: false
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ vars.FORK_KIT_APP_ID }}
+          private-key: ${{ secrets.FORK_KIT_APP_KEY }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+      - uses: BierDav/fork-kit@SHA # vX.Y.Z
+        with:
+          command: sync
+          token: ${{ steps.app.outputs.token }}
+          allow-workflow-changes: ${{ inputs.allow-workflow-changes == true }}
+
+  # When someone other than fork-kit pushes to the sync PR, turn auto-merge off.
+  guard:
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    concurrency:
+      group: fork-kit-guard-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      # The base branch, not the pull request: nothing from the PR is executed.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: BierDav/fork-kit@SHA # vX.Y.Z
+        with:
+          command: guard
+          token: ${{ github.token }}

@@ -1,0 +1,96 @@
+name: fork-kit
+description: Keep a downstream fork merged with its upstream through one sync pull request.
+author: fork-kit authors
+branding:
+  icon: git-merge
+  color: purple
+
+inputs:
+  command:
+    description: "sync, guard, status or ledger"
+    default: sync
+  token:
+    description: >-
+      Token for the GitHub API. sync needs a GitHub App installation token (see the
+      README) so that its pushes and merges start workflows; GITHUB_TOKEN cannot.
+      git pushes use the credentials actions/checkout stored, so check out with the
+      same token. guard works with GITHUB_TOKEN (pull-requests: write).
+    required: true
+  manifest:
+    description: Path to the manifest.
+    default: .fork-kit.toml
+  dry-run:
+    description: Decide, but push and change nothing (sync and guard).
+    default: "false"
+  allow-workflow-changes:
+    description: >-
+      sync: push even though upstream changed .github/. Set it only after reviewing
+      those changes; pushing makes GitHub run them in this repository.
+    default: "false"
+  report:
+    description: Where to write the JSON result.
+    default: fork-kit-result.json
+  upload-report:
+    description: Upload the JSON result as the artifact "fork-kit-result".
+    default: "true"
+  git-user-name:
+    description: Author of fork-kit's sync commits.
+    default: fork-kit[bot]
+  git-user-email:
+    description: Email of fork-kit's sync commits.
+    default: fork-kit[bot]@users.noreply.github.com
+
+outputs:
+  outcome:
+    description: up-to-date, clean, conflict, hands-off or workflow-review (guard also not-sync-pr)
+    value: ${{ steps.run.outputs.outcome }}
+  upstream-ref:
+    description: The upstream branch or tag being merged.
+    value: ${{ steps.run.outputs.upstream-ref }}
+  upstream-sha:
+    description: The upstream commit being merged.
+    value: ${{ steps.run.outputs.upstream-sha }}
+  pr-url:
+    description: The sync pull request, if any.
+    value: ${{ steps.run.outputs.pr-url }}
+  automerge:
+    description: Whether auto-merge is on for the sync pull request.
+    value: ${{ steps.run.outputs.automerge }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        FORK_KIT_COMMAND: ${{ inputs.command }}
+        FORK_KIT_MANIFEST: ${{ inputs.manifest }}
+        FORK_KIT_REPORT: ${{ inputs.report }}
+        FORK_KIT_DRY_RUN: ${{ inputs.dry-run }}
+        FORK_KIT_ALLOW_WORKFLOWS: ${{ inputs.allow-workflow-changes }}
+        FORK_KIT_GIT_NAME: ${{ inputs.git-user-name }}
+        FORK_KIT_GIT_EMAIL: ${{ inputs.git-user-email }}
+      run: |
+        set -euo pipefail
+        case "$FORK_KIT_COMMAND" in
+          sync|guard|status|ledger) ;;
+          *) echo "::error::fork-kit: unknown command $FORK_KIT_COMMAND"; exit 2 ;;
+        esac
+        extra=()
+        if [[ "$FORK_KIT_DRY_RUN" == "true" && "$FORK_KIT_COMMAND" =~ ^(sync|guard)$ ]]; then
+          extra+=(--dry-run)
+        fi
+        if [[ "$FORK_KIT_ALLOW_WORKFLOWS" == "true" && "$FORK_KIT_COMMAND" == sync ]]; then
+          extra+=(--allow-workflow-changes)
+        fi
+        python3 "$GITHUB_ACTION_PATH/fork_kit.py" --manifest "$FORK_KIT_MANIFEST" \
+          --report "$FORK_KIT_REPORT" "$FORK_KIT_COMMAND" "${extra[@]}"
+    - if: always() && inputs.upload-report == 'true'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: fork-kit-result
+        path: ${{ inputs.report }}
+        if-no-files-found: ignore
+        retention-days: 30
+        overwrite: true
