@@ -18,7 +18,7 @@ import type { Manifest } from "./manifest.ts";
 import { naturalCompare, patchesFor, SAFE_REF } from "./text.ts";
 
 export const TRAILER = "Fork-Kit-Upstream";
-const UPSTREAM_REF = "refs/fork-kit/upstream";
+const UPSTREAM_REF = "refs/fork-kit-state/upstream";
 
 export type Outcome = "up-to-date" | "clean" | "conflict" | "hands-off" | "workflow-review" | "not-sync-pr";
 export type SyncState = "none" | "pure" | "stale" | "foreign";
@@ -77,11 +77,11 @@ async function resolveUpstream(m: Manifest, forge: Forge): Promise<[string, stri
 
 /** Fetch the fork branch and the sync branch from origin. */
 function fetchFork(m: Manifest): [string, string | null] {
-  git(["fetch", "--quiet", "--no-tags", "origin", `+refs/heads/${m.branch}:refs/fork-kit/fork`]);
-  const fork = git(["rev-parse", "refs/fork-kit/fork"]);
+  git(["fetch", "--quiet", "--no-tags", "origin", `+refs/heads/${m.branch}:refs/fork-kit-state/fork`]);
+  const fork = git(["rev-parse", "refs/fork-kit-state/fork"]);
   if (!git(["ls-remote", "origin", `refs/heads/${m.syncBranch}`])) return [fork, null];
-  git(["fetch", "--quiet", "--no-tags", "origin", `+refs/heads/${m.syncBranch}:refs/fork-kit/sync`]);
-  return [fork, git(["rev-parse", "refs/fork-kit/sync"])];
+  git(["fetch", "--quiet", "--no-tags", "origin", `+refs/heads/${m.syncBranch}:refs/fork-kit-state/sync`]);
+  return [fork, git(["rev-parse", "refs/fork-kit-state/sync"])];
 }
 
 /**

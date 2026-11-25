@@ -14,7 +14,7 @@ inputs:
       Token for the GitHub API. sync needs a GitHub App installation token (see the
       README) so that its pushes and merges start workflows; GITHUB_TOKEN cannot.
       git pushes use the credentials actions/checkout stored, so check out with the
-      same token. guard works with GITHUB_TOKEN (pull-requests: write).
+      same token. guard works with GITHUB_TOKEN (pull-requests: write, issues: write, statuses: write).
     required: true
   manifest:
     description: Path to the manifest.

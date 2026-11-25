@@ -60,8 +60,24 @@ Auto-merge is requested only when all of these hold:
 - the merge has no conflicts;
 - upstream changed nothing under `.github/`;
 - your fork branch's checks and commit statuses are not failing and could be read;
-- the PR has no `fork-kit:hold` label (add it to keep a PR from merging itself);
+- the PR has no `fork-kit:hold` label;
 - the manifest allows it.
+
+### Holding a pull request
+
+The guard sets the commit status `fork-kit/hold` on every pull request into
+your fork branch, the sync PR and your own alike. It passes normally and fails
+while the PR has the `fork-kit:hold` label; adding the label also turns
+auto-merge off. Make `fork-kit/hold` a required check of the fork branch (see
+Setup) and a held PR cannot merge, by hand or automatically, until the label
+is removed. The guard reacts to the label at once (`labeled`, `unlabeled`).
+
+Removing the label does not turn auto-merge back on: the guard runs with
+`GITHUB_TOKEN`, and a merge it enabled would not start your release workflows.
+The next `sync` run requests it again, or merge by hand.
+
+The label holds one pull request. It does not stop what your release workflows
+do after something else merges into the fork branch; hold deployments there.
 
 ## Trust model
 
@@ -154,8 +170,10 @@ files.
 - Allow **merge commits**; fork-kit requests auto-merge with the merge method.
   Squash or rebase would throw away upstream's history.
 - A **ruleset** on your fork branch: require a pull request, require your test
-  and build checks, block force pushes and deletions. Without required checks,
-  auto-merge would merge immediately.
+  and build checks and `fork-kit/hold`, block force pushes and deletions.
+  Without required checks, auto-merge would merge immediately. Add
+  `fork-kit/hold` only once the guard from the template runs on the fork
+  branch; until then nothing sets it and no PR could merge.
 
 ### 4. The workflow
 
@@ -177,7 +195,7 @@ fork-kit [--manifest PATH] [--json] [--report FILE] COMMAND
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | `status`                                      | Where the fork stands against upstream. Changes nothing.                                                                        |
 | `sync [--dry-run] [--allow-workflow-changes]` | Merge the newest upstream into the sync branch and keep the PR current.                                                         |
-| `guard [--dry-run]`                           | Turn auto-merge off if someone other than fork-kit pushed to the sync branch.                                                   |
+| `guard [--dry-run]`                           | Set `fork-kit/hold` on the triggering PR; turn auto-merge off if it is held or someone else pushed to the sync branch.          |
 | `ledger [--strict]`                           | List changed files no patch claims, and patches that claim no changed file (possibly upstreamed).                               |
 | `resolve`                                     | Locally: check out the sync branch, merge your fork branch into it, and list conflicting files with the patches they belong to. |
 
@@ -262,7 +280,8 @@ workflow uploads as the artifact `fork-kit-result`):
   decides when a merge is safe to take.
 - **A small race:** someone with write access pushes to the sync PR while
   auto-merge is on, and the required checks finish before the guard has run.
-  Add the `fork-kit:hold` label before you push to rule this out.
+  Add the `fork-kit:hold` label before you push to rule this out: with
+  `fork-kit/hold` required, the PR cannot merge while it is held.
 
 ## Prior art
 

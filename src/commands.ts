@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import {
   type CheckState,
   type Forge,
@@ -10,13 +11,14 @@ import {
   LABEL_OWNER,
   LABEL_WORKFLOWS,
   type PR,
+  STATUS_HOLD,
 } from "./forge.ts";
 import { Failure, git, gitOk, gitPaths, mergeTree, parentsOf, trailerValue } from "./git.ts";
 import type { Manifest } from "./manifest.ts";
 import { type Conflict, identity, type Outcome, type Plan, plan, type SyncState, TRAILER } from "./plan.ts";
 import { githubSlug, globMatch, md, patchesFor } from "./text.ts";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 export const SCHEMA = 1;
 const MARKER = "<!-- fork-kit -->";
 
@@ -226,8 +228,66 @@ export async function sync(m: Manifest, forge: Forge, opts: Options): Promise<Re
 }
 
 /** On pushes to the sync PR: if anyone but fork-kit pushed, switch auto-merge off and keep out. */
+/** The pull request a pull_request(_target) event is about, from the event payload. */
+interface EventPr {
+  number: number;
+  headSha: string;
+  headRef: string;
+  baseRef: string;
+  labels: string[];
+  automerge: boolean;
+}
+
+export function eventPr(path = process.env.GITHUB_EVENT_PATH): EventPr | null {
+  if (!path) return null;
+  let event: unknown;
+  try {
+    event = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+  const pr = (event as { pull_request?: Record<string, unknown> } | null)?.pull_request;
+  if (!pr || typeof pr.number !== "number") return null;
+  const head = (pr.head ?? {}) as { sha?: unknown; ref?: unknown };
+  const base = (pr.base ?? {}) as { ref?: unknown };
+  if (typeof head.sha !== "string" || typeof head.ref !== "string" || typeof base.ref !== "string") return null;
+  const labels = Array.isArray(pr.labels) ? pr.labels : [];
+  return {
+    number: pr.number,
+    headSha: head.sha,
+    headRef: head.ref,
+    baseRef: base.ref,
+    labels: labels.map((l) => (typeof l === "string" ? l : String((l as { name?: unknown })?.name ?? ""))),
+    automerge: pr.auto_merge != null,
+  };
+}
+
+/**
+ * Runs on every pull request into the fork branch (pull_request_target: opened, synchronize, reopened,
+ * labeled, unlabeled). It sets the fork-kit/hold status, failing while the PR has the hold label (and turns
+ * auto-merge off then), so a ruleset that requires the status keeps a held PR from merging. On the sync PR
+ * it also turns auto-merge off when someone other than fork-kit pushed to the sync branch.
+ */
 export async function guard(m: Manifest, forge: Forge, opts: Options): Promise<Result> {
-  const headRef = process.env.GITHUB_HEAD_REF;
+  const event = eventPr();
+  const notes: string[] = [];
+  if (event && event.baseRef === m.branch) {
+    const held = event.labels.includes(LABEL_HOLD);
+    if (!opts.dryRun) {
+      await forge.setStatus(
+        event.headSha,
+        held ? "failure" : "success",
+        held ? `Held: remove the ${LABEL_HOLD} label to merge` : `Not held (add ${LABEL_HOLD} to hold)`,
+      );
+      if (held && event.automerge) await forge.automerge(event.number, false);
+    }
+    notes.push(
+      held
+        ? `#${event.number} is held with ${LABEL_HOLD}: ${STATUS_HOLD} fails and auto-merge is off`
+        : `#${event.number} is not held: ${STATUS_HOLD} passes`,
+    );
+  }
+  const headRef = event?.headRef ?? process.env.GITHUB_HEAD_REF;
   if (headRef && headRef !== m.syncBranch) {
     return {
       schema: SCHEMA,
@@ -238,18 +298,19 @@ export async function guard(m: Manifest, forge: Forge, opts: Options): Promise<R
       workflow_changes: [],
       pr: null,
       automerge: false,
-      notes: [`${headRef} is not ${m.syncBranch}`],
+      notes: [...notes, `${headRef} is not ${m.syncBranch}`],
     };
   }
   const p = await plan(m, forge);
   const result = reportBase("guard", m, p);
+  result.notes.push(...notes);
   const pr = await forge.findPr(m.syncBranch, m.branch);
   if (pr === null || p.syncSha === null) {
     result.notes.push("no open sync PR");
     return result;
   }
   result.pr = prRef(pr);
-  result.automerge = pr.automerge;
+  result.automerge = pr.automerge && !(event?.labels.includes(LABEL_HOLD) ?? false);
   if (p.syncState !== "foreign") {
     result.notes.push("the sync branch holds only fork-kit's commit");
     return result;
@@ -294,7 +355,9 @@ export async function resolve(m: Manifest, forge: Forge): Promise<Result> {
   const merged = spawnSync("git", ["merge", "--no-ff", "--no-edit", p.forkSha], { encoding: "utf8" });
   if (merged.status === 0) {
     result.conflicts = [];
-    result.notes.push(`merged ${m.branch} cleanly; review, test and push ${m.syncBranch}`);
+    result.notes.push(
+      `merged ${m.branch} cleanly; review, test, then \`git push origin HEAD:refs/heads/${m.syncBranch}\``,
+    );
     return result;
   }
   result.conflicts = gitPaths(["diff", "--name-only", "--diff-filter=U"]).map((path) => ({
@@ -312,6 +375,6 @@ export async function resolve(m: Manifest, forge: Forge): Promise<Result> {
       if (pt.upstream !== "none") console.log(`    upstream: ${pt.upstream}`);
     }
   }
-  result.notes.push(`resolve the conflicts, \`git commit\`, then \`git push origin ${m.syncBranch}\``);
+  result.notes.push(`resolve the conflicts, \`git commit\`, then \`git push origin HEAD:refs/heads/${m.syncBranch}\``);
   return result;
 }

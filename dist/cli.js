@@ -1357,6 +1357,7 @@ import { appendFileSync, writeFileSync as writeFileSync2 } from "node:fs";
 
 // src/commands.ts
 import { spawnSync as spawnSync3 } from "node:child_process";
+import { readFileSync as readFileSync2 } from "node:fs";
 
 // src/forge.ts
 import { spawnSync as spawnSync2 } from "node:child_process";
@@ -5519,11 +5520,12 @@ var LABEL_CONFLICT = "fork-kit:conflict";
 var LABEL_WORKFLOWS = "fork-kit:workflow-change";
 var LABEL_OWNER = "fork-kit:needs-owner";
 var LABEL_HOLD = "fork-kit:hold";
+var STATUS_HOLD = "fork-kit/hold";
 var LABELS = {
   [LABEL_CONFLICT]: ["b60205", "Merging upstream conflicts with the fork"],
   [LABEL_WORKFLOWS]: ["fbca04", "Upstream changed .github/; needs a human"],
   [LABEL_OWNER]: ["5319e7", "Someone else pushed to the sync branch; fork-kit keeps out"],
-  [LABEL_HOLD]: ["d4c5f9", "Set by a human: fork-kit never enables auto-merge"]
+  [LABEL_HOLD]: ["d4c5f9", "Set by a human: the fork-kit/hold check fails, so the PR cannot merge"]
 };
 function summarizeChecks(runs) {
   if (runs.length === 0)
@@ -5658,6 +5660,8 @@ class GitHubForge {
       const ownUrls = [...own].map((id) => `/actions/runs/${id}/`);
       const items = runs.filter((r) => !ownUrls.some((u) => (r.details_url ?? "").includes(u))).map((r) => [r.status, r.conclusion]);
       for (const s of combined.statuses) {
+        if (s.context === STATUS_HOLD)
+          continue;
         if (s.state === "failure" || s.state === "error")
           items.push(["completed", "failure"]);
         else if (s.state === "success")
@@ -5669,6 +5673,9 @@ class GitHubForge {
     } catch {
       return "error";
     }
+  }
+  async setStatus(sha, state, description) {
+    await this.octokit.rest.repos.createCommitStatus({ ...this.r, sha, state, context: STATUS_HOLD, description });
   }
 }
 
@@ -5741,6 +5748,10 @@ class FakeForge {
   async checks(sha) {
     return this.state.checks?.[sha] ?? "unknown";
   }
+  async setStatus(sha, state, description) {
+    this.state.statuses = { ...this.state.statuses, [sha]: state };
+    this.save("status", { sha, state, description });
+  }
 }
 function localToken() {
   const env = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
@@ -5763,7 +5774,7 @@ function makeForge() {
 
 // src/plan.ts
 var TRAILER = "Fork-Kit-Upstream";
-var UPSTREAM_REF = "refs/fork-kit/upstream";
+var UPSTREAM_REF = "refs/fork-kit-state/upstream";
 function identity() {
   const name = process.env.FORK_KIT_GIT_NAME || "fork-kit[bot]";
   const email = process.env.FORK_KIT_GIT_EMAIL || "fork-kit[bot]@users.noreply.github.com";
@@ -5794,12 +5805,12 @@ async function resolveUpstream(m, forge) {
   return [ref, git(["rev-parse", `${UPSTREAM_REF}^{commit}`])];
 }
 function fetchFork(m) {
-  git(["fetch", "--quiet", "--no-tags", "origin", `+refs/heads/${m.branch}:refs/fork-kit/fork`]);
-  const fork = git(["rev-parse", "refs/fork-kit/fork"]);
+  git(["fetch", "--quiet", "--no-tags", "origin", `+refs/heads/${m.branch}:refs/fork-kit-state/fork`]);
+  const fork = git(["rev-parse", "refs/fork-kit-state/fork"]);
   if (!git(["ls-remote", "origin", `refs/heads/${m.syncBranch}`]))
     return [fork, null];
-  git(["fetch", "--quiet", "--no-tags", "origin", `+refs/heads/${m.syncBranch}:refs/fork-kit/sync`]);
-  return [fork, git(["rev-parse", "refs/fork-kit/sync"])];
+  git(["fetch", "--quiet", "--no-tags", "origin", `+refs/heads/${m.syncBranch}:refs/fork-kit-state/sync`]);
+  return [fork, git(["rev-parse", "refs/fork-kit-state/sync"])];
 }
 function classifySync(sync, fork) {
   const recorded = trailerValue(sync, TRAILER);
@@ -5859,7 +5870,7 @@ async function plan(m, forge) {
 }
 
 // src/commands.ts
-var VERSION10 = "0.2.0";
+var VERSION10 = "0.3.0";
 var SCHEMA = 1;
 var MARKER = "<!-- fork-kit -->";
 function reportBase(command, m, p) {
@@ -6025,8 +6036,45 @@ Upstream moved to **${p.upstreamRef}** (\`${p.upstreamSha.slice(0, 8)}\`). This 
   result.pr = prRef(pr);
   return result;
 }
+function eventPr(path = process.env.GITHUB_EVENT_PATH) {
+  if (!path)
+    return null;
+  let event;
+  try {
+    event = JSON.parse(readFileSync2(path, "utf8"));
+  } catch {
+    return null;
+  }
+  const pr = event?.pull_request;
+  if (!pr || typeof pr.number !== "number")
+    return null;
+  const head = pr.head ?? {};
+  const base = pr.base ?? {};
+  if (typeof head.sha !== "string" || typeof head.ref !== "string" || typeof base.ref !== "string")
+    return null;
+  const labels = Array.isArray(pr.labels) ? pr.labels : [];
+  return {
+    number: pr.number,
+    headSha: head.sha,
+    headRef: head.ref,
+    baseRef: base.ref,
+    labels: labels.map((l) => typeof l === "string" ? l : String(l?.name ?? "")),
+    automerge: pr.auto_merge != null
+  };
+}
 async function guard(m, forge, opts) {
-  const headRef = process.env.GITHUB_HEAD_REF;
+  const event = eventPr();
+  const notes = [];
+  if (event && event.baseRef === m.branch) {
+    const held = event.labels.includes(LABEL_HOLD);
+    if (!opts.dryRun) {
+      await forge.setStatus(event.headSha, held ? "failure" : "success", held ? `Held: remove the ${LABEL_HOLD} label to merge` : `Not held (add ${LABEL_HOLD} to hold)`);
+      if (held && event.automerge)
+        await forge.automerge(event.number, false);
+    }
+    notes.push(held ? `#${event.number} is held with ${LABEL_HOLD}: ${STATUS_HOLD} fails and auto-merge is off` : `#${event.number} is not held: ${STATUS_HOLD} passes`);
+  }
+  const headRef = event?.headRef ?? process.env.GITHUB_HEAD_REF;
   if (headRef && headRef !== m.syncBranch) {
     return {
       schema: SCHEMA,
@@ -6037,18 +6085,19 @@ async function guard(m, forge, opts) {
       workflow_changes: [],
       pr: null,
       automerge: false,
-      notes: [`${headRef} is not ${m.syncBranch}`]
+      notes: [...notes, `${headRef} is not ${m.syncBranch}`]
     };
   }
   const p = await plan(m, forge);
   const result = reportBase("guard", m, p);
+  result.notes.push(...notes);
   const pr = await forge.findPr(m.syncBranch, m.branch);
   if (pr === null || p.syncSha === null) {
     result.notes.push("no open sync PR");
     return result;
   }
   result.pr = prRef(pr);
-  result.automerge = pr.automerge;
+  result.automerge = pr.automerge && !(event?.labels.includes(LABEL_HOLD) ?? false);
   if (p.syncState !== "foreign") {
     result.notes.push("the sync branch holds only fork-kit's commit");
     return result;
@@ -6092,7 +6141,7 @@ async function resolve(m, forge) {
   const merged = spawnSync3("git", ["merge", "--no-ff", "--no-edit", p.forkSha], { encoding: "utf8" });
   if (merged.status === 0) {
     result.conflicts = [];
-    result.notes.push(`merged ${m.branch} cleanly; review, test and push ${m.syncBranch}`);
+    result.notes.push(`merged ${m.branch} cleanly; review, test, then \`git push origin HEAD:refs/heads/${m.syncBranch}\``);
     return result;
   }
   result.conflicts = gitPaths(["diff", "--name-only", "--diff-filter=U"]).map((path) => ({
@@ -6113,12 +6162,12 @@ async function resolve(m, forge) {
         console.log(`    upstream: ${pt.upstream}`);
     }
   }
-  result.notes.push(`resolve the conflicts, \`git commit\`, then \`git push origin ${m.syncBranch}\``);
+  result.notes.push(`resolve the conflicts, \`git commit\`, then \`git push origin HEAD:refs/heads/${m.syncBranch}\``);
   return result;
 }
 
 // src/manifest.ts
-import { existsSync as existsSync2, readFileSync as readFileSync2 } from "node:fs";
+import { existsSync as existsSync2, readFileSync as readFileSync3 } from "node:fs";
 import { basename } from "node:path";
 
 // node_modules/smol-toml/dist/error.js
@@ -7099,7 +7148,7 @@ function loadManifest(path) {
     throw new Failure(`no manifest at ${path}`);
   let data;
   try {
-    data = parse3(readFileSync2(path, "utf8"));
+    data = parse3(readFileSync3(path, "utf8"));
   } catch (e) {
     throw new Failure(`${path}: ${e.message}`);
   }

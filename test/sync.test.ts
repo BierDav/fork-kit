@@ -223,6 +223,53 @@ describe("sync", () => {
     expect(r.cli(["guard"], { env: { GITHUB_HEAD_REF: "feature" } })[0].outcome).toBe("not-sync-pr");
   });
 
+  test("guard sets fork-kit/hold on every PR into the fork branch, failing while it is held", () => {
+    commit(r.upstream, "src/new.txt", "new\n", "upstream: new");
+    r.cli(["sync"]);
+    const sync = r.syncSha();
+    const event = (labels: string[], head = "fork-kit/sync", sha = sync, base = "patched") => {
+      const path = join(r.tmp, `event-${Math.random()}.json`);
+      const pr = { number: 1, head: { ref: head, sha }, base: { ref: base }, labels: labels.map((name) => ({ name })) };
+      writeFileSync(path, JSON.stringify({ pull_request: { ...pr, auto_merge: { merge_method: "merge" } } }));
+      return { GITHUB_EVENT_PATH: path };
+    };
+    const statusCalls = () =>
+      (r.state().calls as { call: string; sha?: string; state?: string }[]).filter((c) => c.call === "status");
+
+    // Held: the status fails and auto-merge goes off.
+    const [held] = r.cli(["guard"], { env: event([LABEL_HOLD]) });
+    expect(statusCalls().at(-1)).toMatchObject({ sha: sync, state: "failure" });
+    expect(r.state().prs[0]?.automerge).toBe(false);
+    expect(held.automerge).toBe(false);
+
+    // Unheld: the status passes; auto-merge stays off until sync requests it again.
+    r.cli(["guard"], { env: event([]) });
+    expect(statusCalls().at(-1)).toMatchObject({ sha: sync, state: "success" });
+    expect(r.state().prs[0]?.automerge).toBe(false);
+    expect(r.cli(["sync"])[0].automerge).toBe(true);
+
+    // Any other PR into the fork branch gets the status too.
+    const [other] = r.cli(["guard"], { env: event([LABEL_HOLD], "feature", "a".repeat(40)) });
+    expect(other.outcome).toBe("not-sync-pr");
+    expect(statusCalls().at(-1)).toMatchObject({ sha: "a".repeat(40), state: "failure" });
+
+    // A PR into another branch is not fork-kit's business.
+    const before = statusCalls().length;
+    r.cli(["guard"], { env: event([LABEL_HOLD], "feature", "b".repeat(40), "main") });
+    expect(statusCalls()).toHaveLength(before);
+  });
+
+  test("sync never requests auto-merge for a held PR", () => {
+    commit(r.upstream, "src/new.txt", "new\n", "upstream: new");
+    r.cli(["sync"]);
+    r.editState((s) => {
+      (s.prs[0] as { labels: string[] }).labels = [LABEL_HOLD];
+    });
+    const [res] = r.cli(["sync"]);
+    expect(res.automerge).toBe(false);
+    expect(r.state().prs[0]?.automerge).toBe(false);
+  });
+
   test("a dry run pushes nothing", () => {
     commit(r.upstream, "src/new.txt", "new\n", "upstream: new");
     const [res] = r.cli(["sync", "--dry-run"]);
@@ -260,6 +307,12 @@ describe("sync", () => {
     expect(res.conflicts).toEqual([{ path: "src/hello.txt", patches: ["greeting"] }]);
     expect(proc.stdout).toContain("patch greeting: Greet in German");
     expect(git(r.work, ["branch", "--show-current"])).toBe("fork-kit/sync");
+    // The push it suggests works, and the branch name is not shadowed by fork-kit's own refs.
+    expect(res.notes.at(-1)).toContain("git push origin HEAD:refs/heads/fork-kit/sync");
+    writeFileSync(join(r.work, "src/hello.txt"), "hallo hi\nworld\n");
+    git(r.work, ["commit", "-qam", "resolve"]);
+    git(r.work, ["push", "-q", "origin", "fork-kit/sync"]);
+    expect(r.syncSha()).toBe(git(r.work, ["rev-parse", "HEAD"]));
   });
 
   test("unrelated histories explain themselves", () => {

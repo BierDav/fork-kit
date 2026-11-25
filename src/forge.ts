@@ -29,17 +29,21 @@ export interface Forge {
   comments(num: number): Promise<string[]>;
   comment(num: number, body: string): Promise<void>;
   checks(sha: string): Promise<CheckState>;
+  /** Sets fork-kit's own commit status (STATUS_HOLD) on a commit. */
+  setStatus(sha: string, state: "success" | "failure", description: string): Promise<void>;
 }
 
 export const LABEL_CONFLICT = "fork-kit:conflict";
 export const LABEL_WORKFLOWS = "fork-kit:workflow-change";
 export const LABEL_OWNER = "fork-kit:needs-owner";
 export const LABEL_HOLD = "fork-kit:hold";
+/** The commit status the guard sets on every pull request into the fork branch; fails while it is held. */
+export const STATUS_HOLD = "fork-kit/hold";
 const LABELS: Record<string, [string, string]> = {
   [LABEL_CONFLICT]: ["b60205", "Merging upstream conflicts with the fork"],
   [LABEL_WORKFLOWS]: ["fbca04", "Upstream changed .github/; needs a human"],
   [LABEL_OWNER]: ["5319e7", "Someone else pushed to the sync branch; fork-kit keeps out"],
-  [LABEL_HOLD]: ["d4c5f9", "Set by a human: fork-kit never enables auto-merge"],
+  [LABEL_HOLD]: ["d4c5f9", "Set by a human: the fork-kit/hold check fails, so the PR cannot merge"],
 };
 
 export function summarizeChecks(runs: [status: string, conclusion: string | null][]): CheckState {
@@ -192,6 +196,7 @@ export class GitHubForge implements Forge {
         .filter((r) => !ownUrls.some((u) => (r.details_url ?? "").includes(u)))
         .map((r) => [r.status, r.conclusion]);
       for (const s of combined.statuses) {
+        if (s.context === STATUS_HOLD) continue;
         if (s.state === "failure" || s.state === "error") items.push(["completed", "failure"]);
         else if (s.state === "success") items.push(["completed", "success"]);
         else items.push(["queued", null]);
@@ -200,6 +205,10 @@ export class GitHubForge implements Forge {
     } catch {
       return "error";
     }
+  }
+
+  async setStatus(sha: string, state: "success" | "failure", description: string): Promise<void> {
+    await this.octokit.rest.repos.createCommitStatus({ ...this.r, sha, state, context: STATUS_HOLD, description });
   }
 }
 
@@ -217,6 +226,7 @@ interface FakeState {
   calls: unknown[];
   releases?: Record<string, string>;
   checks?: Record<string, CheckState>;
+  statuses?: Record<string, string>;
 }
 
 /** A forge kept in a JSON file, for tests and local experiments. */
@@ -296,6 +306,11 @@ export class FakeForge implements Forge {
 
   async checks(sha: string) {
     return this.state.checks?.[sha] ?? "unknown";
+  }
+
+  async setStatus(sha: string, state: "success" | "failure", description: string) {
+    this.state.statuses = { ...this.state.statuses, [sha]: state };
+    this.save("status", { sha, state, description });
   }
 }
 

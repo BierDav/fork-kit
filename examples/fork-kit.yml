@@ -15,9 +15,10 @@ on:
         default: false
   # The guard runs the workflow as defined on the base branch and never checks
   # out the pull request's code, so the PR's content cannot change what it does.
+  # labeled/unlabeled: the fork-kit:hold label takes effect at once.
   pull_request_target:
     branches: [patched]
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions: {}
 
@@ -59,7 +60,10 @@ jobs:
           path: ${{ steps.fork-kit.outputs.report }}
           retention-days: 30
 
-  # When someone other than fork-kit pushes to the sync PR, turn auto-merge off.
+  # Sets the fork-kit/hold status on every PR into the fork branch: it fails
+  # while the PR has the fork-kit:hold label (require it in the branch's
+  # ruleset). On the sync PR, also turns auto-merge off when someone other
+  # than fork-kit pushed to it.
   guard:
     if: >-
       github.event_name == 'pull_request_target' &&
@@ -70,6 +74,7 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
+      statuses: write
     concurrency:
       group: fork-kit-guard-${{ github.event.pull_request.number }}
       cancel-in-progress: true
