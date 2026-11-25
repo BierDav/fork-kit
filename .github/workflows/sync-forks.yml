@@ -5,8 +5,9 @@
 name: sync-forks
 
 on:
+  # Every two hours: t3code tracks upstream's nightlies.
   schedule:
-    - cron: "23 */6 * * *"
+    - cron: "23 */2 * * *"
   workflow_dispatch:
     inputs:
       repository:
@@ -95,13 +96,26 @@ jobs:
         with:
           path: tool
           persist-credentials: false
-      # The fork, with the App's credentials for fork-kit's pushes.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ github.repository_owner }}/${{ matrix.fork }}
-          path: fork
-          fetch-depth: 0
-          token: ${{ steps.app.outputs.token }}
+      # The fork's default branch with full history, and only the manifest in the
+      # work tree: fork-kit works on git objects and fetches the other branches
+      # itself. Not actions/checkout, which fails on gitlinks without a
+      # .gitmodules entry (t3code vendors some). Like checkout, this keeps the
+      # token in the repository's git config for fork-kit's fetches and pushes.
+      - name: Fetch the fork
+        env:
+          TOKEN: ${{ steps.app.outputs.token }}
+          FORK: ${{ github.repository_owner }}/${{ matrix.fork }}
+        run: |
+          set -euo pipefail
+          git init -q fork
+          cd fork
+          git remote add origin "$GITHUB_SERVER_URL/$FORK.git"
+          git config "http.$GITHUB_SERVER_URL/.extraheader" "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          branch="$(git ls-remote --symref origin HEAD | sed -n 's|^ref: refs/heads/\(.*\)\tHEAD$|\1|p')"
+          test -n "$branch"
+          git fetch -q --no-tags origin "+refs/heads/$branch:refs/remotes/origin/$branch"
+          git sparse-checkout set --no-cone /.fork-kit.toml
+          git checkout -q --detach "origin/$branch"
       - id: fork-kit
         uses: ./tool
         with:
