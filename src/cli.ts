@@ -19,7 +19,7 @@ const COMMANDS: Record<string, [help: string, flags: string[]]> = {
   resolve: ["locally: check out the sync branch and merge the fork into it to resolve conflicts", []],
 };
 
-const USAGE = `usage: fork-kit [--manifest PATH] [--report FILE] [--json] COMMAND [FLAGS]
+const USAGE = `usage: fork-kit [--repo OWNER/NAME] [--manifest PATH] [--report FILE] [--json] COMMAND [FLAGS]
 
 Keep a downstream fork merged with its upstream through one sync pull request.
 
@@ -29,6 +29,7 @@ ${Object.entries(COMMANDS)
   .join("\n")}
 
 options:
+  --repo OWNER/NAME the fork on GitHub (default: FORK_KIT_REPOSITORY, GITHUB_REPOSITORY, or origin)
   --manifest PATH   the manifest (default: .fork-kit.toml)
   --report FILE     also write the JSON result to FILE
   --json            print the JSON result instead of a summary
@@ -83,6 +84,7 @@ function emit(r: Result, json: boolean, report: string | undefined): void {
 export async function main(argv: string[]): Promise<number> {
   let manifest = ".fork-kit.toml";
   let report: string | undefined;
+  let repo: string | undefined;
   let json = false;
   let command: string | undefined;
   const flags = new Set<string>();
@@ -95,10 +97,11 @@ export async function main(argv: string[]): Promise<number> {
       process.stdout.write(`fork-kit ${VERSION}\n`);
       return 0;
     } else if (a === "--json") json = true;
-    else if (a === "--manifest" || a === "--report") {
+    else if (a === "--manifest" || a === "--report" || a === "--repo") {
       const v = argv[++i];
       if (v === undefined) return usageError(`${a} needs a value`);
       if (a === "--manifest") manifest = v;
+      else if (a === "--repo") repo = v;
       else report = v;
     } else if (!command && !a.startsWith("-")) {
       if (!(a in COMMANDS)) return usageError(`unknown command ${a}`);
@@ -115,7 +118,7 @@ export async function main(argv: string[]): Promise<number> {
   let r: Result;
   try {
     const m = loadManifest(manifest);
-    const forge = makeForge();
+    const forge = makeForge(repo);
     if (command === "sync") r = await sync(m, forge, opts);
     else if (command === "guard") r = await guard(m, forge, opts);
     else if (command === "ledger") r = await ledger(m, forge, opts);

@@ -198,16 +198,29 @@ export class GitHubForge implements Forge {
     await this.octokit.rest.issues.createComment({ ...this.r, issue_number: num, body });
   }
 
-  /** Runs of the workflow fork-kit itself runs in, so its own jobs don't count as the fork's checks. */
+  /**
+   * The fork's workflow that runs fork-kit, so its own jobs don't count as the fork's checks:
+   * FORK_KIT_WORKFLOW (a path in the fork, set when fork-kit runs from another repository),
+   * else the workflow running now if it belongs to the fork.
+   */
+  private ownWorkflow(): string | undefined {
+    if (process.env.FORK_KIT_WORKFLOW) return process.env.FORK_KIT_WORKFLOW;
+    const m = /^([^/]+)\/([^/]+)\/(.+?)@/.exec(process.env.GITHUB_WORKFLOW_REF ?? "");
+    if (!m) return undefined;
+    const same = `${m[1]}/${m[2]}`.toLowerCase() === `${this.owner}/${this.repo}`.toLowerCase();
+    return same ? m[3] : undefined;
+  }
+
+  /** Runs of the workflow fork-kit itself runs in (see ownWorkflow). */
   private async ownRuns(sha: string): Promise<Set<number>> {
-    const m = /^[^/]+\/[^/]+\/(.+?)@/.exec(process.env.GITHUB_WORKFLOW_REF ?? "");
-    if (!m) return new Set();
+    const path = this.ownWorkflow();
+    if (!path) return new Set();
     const runs = await this.octokit.paginate(this.octokit.rest.actions.listWorkflowRunsForRepo, {
       ...this.r,
       head_sha: sha,
       per_page: 100,
     });
-    return new Set(runs.filter((r) => r.path === m[1]).map((r) => r.id));
+    return new Set(runs.filter((r) => r.path === path).map((r) => r.id));
   }
 
   async checks(sha: string): Promise<CheckState> {
@@ -389,11 +402,19 @@ function localToken(): string | undefined {
   return gh.status === 0 && gh.stdout.trim() ? gh.stdout.trim() : undefined;
 }
 
-export function makeForge(): Forge {
+/**
+ * The fork's repository: --repo, else FORK_KIT_REPOSITORY, else GITHUB_REPOSITORY, else origin.
+ * --repo and FORK_KIT_REPOSITORY let one workflow sync forks in other repositories.
+ */
+export function makeForge(repo?: string): Forge {
   const spec = process.env.FORK_KIT_FORGE ?? "github";
   if (spec.startsWith("fake:")) return new FakeForge(spec.slice(5));
   if (spec !== "github") throw new Failure(`unknown FORK_KIT_FORGE ${JSON.stringify(spec)}`);
-  const slug = process.env.GITHUB_REPOSITORY || githubSlug(git(["remote", "get-url", "origin"]));
-  if (!slug) throw new Failure("origin is not a github.com repository; set GITHUB_REPOSITORY");
+  const slug =
+    repo ||
+    process.env.FORK_KIT_REPOSITORY ||
+    process.env.GITHUB_REPOSITORY ||
+    githubSlug(git(["remote", "get-url", "origin"]));
+  if (!slug) throw new Failure("origin is not a github.com repository; pass --repo OWNER/NAME");
   return new GitHubForge(slug, localToken());
 }

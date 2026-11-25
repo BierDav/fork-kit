@@ -5653,16 +5653,25 @@ class GitHubForge {
   async comment(num, body) {
     await this.octokit.rest.issues.createComment({ ...this.r, issue_number: num, body });
   }
-  async ownRuns(sha) {
-    const m = /^[^/]+\/[^/]+\/(.+?)@/.exec(process.env.GITHUB_WORKFLOW_REF ?? "");
+  ownWorkflow() {
+    if (process.env.FORK_KIT_WORKFLOW)
+      return process.env.FORK_KIT_WORKFLOW;
+    const m = /^([^/]+)\/([^/]+)\/(.+?)@/.exec(process.env.GITHUB_WORKFLOW_REF ?? "");
     if (!m)
+      return;
+    const same = `${m[1]}/${m[2]}`.toLowerCase() === `${this.owner}/${this.repo}`.toLowerCase();
+    return same ? m[3] : undefined;
+  }
+  async ownRuns(sha) {
+    const path = this.ownWorkflow();
+    if (!path)
       return new Set;
     const runs = await this.octokit.paginate(this.octokit.rest.actions.listWorkflowRunsForRepo, {
       ...this.r,
       head_sha: sha,
       per_page: 100
     });
-    return new Set(runs.filter((r) => r.path === m[1]).map((r) => r.id));
+    return new Set(runs.filter((r) => r.path === path).map((r) => r.id));
   }
   async checks(sha) {
     try {
@@ -5803,15 +5812,15 @@ function localToken() {
   const gh = spawnSync2("gh", ["auth", "token"], { encoding: "utf8" });
   return gh.status === 0 && gh.stdout.trim() ? gh.stdout.trim() : undefined;
 }
-function makeForge() {
+function makeForge(repo) {
   const spec = process.env.FORK_KIT_FORGE ?? "github";
   if (spec.startsWith("fake:"))
     return new FakeForge(spec.slice(5));
   if (spec !== "github")
     throw new Failure(`unknown FORK_KIT_FORGE ${JSON.stringify(spec)}`);
-  const slug = process.env.GITHUB_REPOSITORY || githubSlug(git(["remote", "get-url", "origin"]));
+  const slug = repo || process.env.FORK_KIT_REPOSITORY || process.env.GITHUB_REPOSITORY || githubSlug(git(["remote", "get-url", "origin"]));
   if (!slug)
-    throw new Failure("origin is not a github.com repository; set GITHUB_REPOSITORY");
+    throw new Failure("origin is not a github.com repository; pass --repo OWNER/NAME");
   return new GitHubForge(slug, localToken());
 }
 
@@ -5951,7 +5960,7 @@ async function plan(m, forge) {
 }
 
 // src/commands.ts
-var VERSION10 = "0.3.1";
+var VERSION10 = "0.4.0";
 var SCHEMA = 1;
 var MARKER = "<!-- fork-kit -->";
 function reportBase(command, m, p) {
@@ -7430,7 +7439,7 @@ var COMMANDS = {
   ledger: ["check that the patch ledger covers every file the fork changes", ["--strict"]],
   resolve: ["locally: check out the sync branch and merge the fork into it to resolve conflicts", []]
 };
-var USAGE = `usage: fork-kit [--manifest PATH] [--report FILE] [--json] COMMAND [FLAGS]
+var USAGE = `usage: fork-kit [--repo OWNER/NAME] [--manifest PATH] [--report FILE] [--json] COMMAND [FLAGS]
 
 Keep a downstream fork merged with its upstream through one sync pull request.
 
@@ -7439,6 +7448,7 @@ ${Object.entries(COMMANDS).map(([name, [help, flags]]) => `  ${`${name} ${flags.
 `)}
 
 options:
+  --repo OWNER/NAME the fork on GitHub (default: FORK_KIT_REPOSITORY, GITHUB_REPOSITORY, or origin)
   --manifest PATH   the manifest (default: .fork-kit.toml)
   --report FILE     also write the JSON result to FILE
   --json            print the JSON result instead of a summary
@@ -7488,6 +7498,7 @@ function emit(r, json, report) {
 async function main(argv) {
   let manifest = ".fork-kit.toml";
   let report;
+  let repo;
   let json = false;
   let command;
   const flags = new Set;
@@ -7502,12 +7513,14 @@ async function main(argv) {
       return 0;
     } else if (a === "--json")
       json = true;
-    else if (a === "--manifest" || a === "--report") {
+    else if (a === "--manifest" || a === "--report" || a === "--repo") {
       const v = argv[++i];
       if (v === undefined)
         return usageError(`${a} needs a value`);
       if (a === "--manifest")
         manifest = v;
+      else if (a === "--repo")
+        repo = v;
       else
         report = v;
     } else if (!command && !a.startsWith("-")) {
@@ -7529,7 +7542,7 @@ async function main(argv) {
   let r;
   try {
     const m = loadManifest(manifest);
-    const forge = makeForge();
+    const forge = makeForge(repo);
     if (command === "sync")
       r = await sync(m, forge, opts);
     else if (command === "guard")

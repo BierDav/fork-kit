@@ -1,0 +1,120 @@
+# Central sync: one App key, every fork. Runs `fork-kit sync` for each repository
+# the fork-kit App is installed on that has .fork-kit.toml on its default branch.
+# The forks themselves keep only the guard (examples/fork-kit-guard.yml) and hold
+# no key. See "Central sync" in the README.
+name: sync-forks
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Only this fork (name or OWNER/NAME); empty for all
+        type: string
+        default: ""
+      allow-workflow-changes:
+        description: Push even though upstream changed .github/ (review those changes first; use with repository)
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Holds FORK_KIT_APP_KEY. Limit its deployment branches to main, so no
+    # pull request into this repository can read the key.
+    environment: fork-kit
+    permissions: {}
+    outputs:
+      forks: ${{ steps.list.outputs.forks }}
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ vars.FORK_KIT_APP_ID }}
+          private-key: ${{ secrets.FORK_KIT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+      - id: list
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ONLY: ${{ inputs.repository }}
+          ALLOW_WORKFLOW_CHANGES: ${{ inputs.allow-workflow-changes == true }}
+        run: |
+          set -euo pipefail
+          only="${ONLY##*/}"
+          if [[ "$ALLOW_WORKFLOW_CHANGES" == true && -z "$only" ]]; then
+            echo "::error::allow-workflow-changes needs a repository: review one fork's upstream .github/ changes at a time"
+            exit 1
+          fi
+          forks=()
+          while IFS=$'\t' read -r name branch; do
+            [[ -z "$only" || "$name" == "$only" ]] || continue
+            if gh api "repos/${GITHUB_REPOSITORY_OWNER}/${name}/contents/.fork-kit.toml?ref=${branch}" --silent 2>/dev/null; then
+              forks+=("$name")
+            fi
+          done < <(gh api --paginate /installation/repositories \
+            --jq '.repositories[] | select((.archived or .disabled) | not) | [.name, .default_branch] | @tsv')
+          if [[ -n "$only" && ${#forks[@]} -eq 0 ]]; then
+            echo "::error::${only} has no .fork-kit.toml on its default branch, or the App is not installed on it"
+            exit 1
+          fi
+          json="$(printf '%s\n' "${forks[@]}" | jq -R . | jq -cs 'map(select(. != ""))')"
+          echo "forks=${json}" >> "$GITHUB_OUTPUT"
+          echo "Forks: ${json}"
+
+  sync:
+    needs: discover
+    if: needs.discover.outputs.forks != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: fork-kit
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        fork: ${{ fromJSON(needs.discover.outputs.forks) }}
+    concurrency:
+      group: fork-kit-sync-${{ matrix.fork }}
+      cancel-in-progress: false
+    steps:
+      # A token for this fork only.
+      - id: app
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ vars.FORK_KIT_APP_ID }}
+          private-key: ${{ secrets.FORK_KIT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ matrix.fork }}
+      # fork-kit itself, at this run's commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+      # The fork, with the App's credentials for fork-kit's pushes.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/${{ matrix.fork }}
+          path: fork
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+      - id: fork-kit
+        uses: ./tool
+        with:
+          command: sync
+          token: ${{ steps.app.outputs.token }}
+          repository: ${{ github.repository_owner }}/${{ matrix.fork }}
+          working-directory: fork
+          workflow: .github/workflows/fork-kit.yml
+          report: fork-kit-result.json
+          allow-workflow-changes: ${{ inputs.allow-workflow-changes == true }}
+      - if: always() && steps.fork-kit.outputs.report != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-kit-result-${{ matrix.fork }}
+          path: ${{ steps.fork-kit.outputs.report }}
+          retention-days: 30

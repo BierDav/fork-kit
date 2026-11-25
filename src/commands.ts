@@ -18,7 +18,7 @@ import type { Manifest } from "./manifest.ts";
 import { type Conflict, identity, type Outcome, type Plan, plan, type SyncState, TRAILER } from "./plan.ts";
 import { githubSlug, globMatch, md, patchesFor } from "./text.ts";
 
-export const VERSION = "0.3.1";
+export const VERSION = "0.4.0";
 export const SCHEMA = 1;
 const MARKER = "<!-- fork-kit -->";
 

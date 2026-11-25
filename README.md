@@ -187,13 +187,41 @@ files.
 
 ### 4. The workflow
 
-Copy [`examples/fork-kit.yml`](examples/fork-kit.yml) to
+Copy [`examples/fork-kit.yml`](examples/fork-kit.yml) (or, with a
+[central sync](#central-sync-one-key-for-every-fork),
+[`examples/fork-kit-guard.yml`](examples/fork-kit-guard.yml)) to
 `.github/workflows/fork-kit.yml`, set your fork branch, and pin `BierDav/fork-kit` to a
 commit SHA. Your existing test, build and release workflows stay as they are.
 Make sure they run:
 
 - on `pull_request` into the fork branch: tests and build, no publishing;
 - on `push` to it: release.
+
+### Central sync: one key for every fork
+
+Instead of a sync job and an App key in every fork, one workflow can sync all
+of them. [`.github/workflows/sync-forks.yml`](.github/workflows/sync-forks.yml)
+runs on a schedule in a repository of your own (this one, for BierDav's forks),
+lists the repositories the App is installed on, and runs `fork-kit sync` for
+each one that has `.fork-kit.toml` on its default branch, with an installation
+token limited to that fork.
+
+- The App key exists once, as `FORK_KIT_APP_KEY` in that repository's
+  `fork-kit` environment (deployment branches: the default branch only), with
+  `FORK_KIT_APP_ID` as a variable. Install the App on **all repositories**, and
+  a new fork needs no credentials at all.
+- Each fork keeps only the guard:
+  [`examples/fork-kit-guard.yml`](examples/fork-kit-guard.yml) as
+  `.github/workflows/fork-kit.yml`. No environment, secret or variable.
+- To push an upstream `.github/` change after reviewing it, run the workflow by
+  hand with the fork's name in `repository` and `allow-workflow-changes` set.
+
+Upstream code never runs where the key is: the central job only runs git
+plumbing and the API, and workflows in the forks never see the key.
+
+The CLI and the action take the fork explicitly for this: `--repo OWNER/NAME`
+(or `FORK_KIT_REPOSITORY`), and the action inputs `repository`,
+`working-directory` and `workflow`.
 
 ## Commands
 

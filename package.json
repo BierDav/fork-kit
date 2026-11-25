@@ -1,6 +1,6 @@
 {
   "name": "fork-kit",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Keep a downstream fork merged with its upstream through one sync pull request.",
   "license": "Apache-2.0",
   "repository": "github:BierDav/fork-kit",

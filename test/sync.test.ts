@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LABEL_CONFLICT, LABEL_HOLD, LABEL_OWNER, LABEL_WORKFLOWS } from "../src/forge.ts";
 import { identity } from "../src/plan.ts";
@@ -521,6 +521,35 @@ describe("action entry", () => {
       expect(outputs).toContain("report=result.json");
       expect(JSON.parse(readFileSync(join(r.work, "result.json"), "utf8")).outcome).toBe("clean");
       expect(r.syncSha()).toBe(""); // dry run
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  test("central mode: working-directory, with the report relative to the workspace", () => {
+    const r = new Repos();
+    try {
+      commit(r.upstream, "src/new.txt", "new\n", "upstream: new");
+      const out = join(r.tmp, "github_output");
+      writeFileSync(out, "");
+      const p = run(r.tmp, ["node", join(ROOT, "dist/action.js")], {
+        check: false,
+        env: {
+          FORK_KIT_FORGE: `fake:${r.forge}`,
+          GITHUB_OUTPUT: out,
+          GITHUB_STEP_SUMMARY: "",
+          INPUT_COMMAND: "sync",
+          INPUT_TOKEN: "secret-token",
+          "INPUT_DRY-RUN": "true",
+          INPUT_REPOSITORY: "o/fork",
+          "INPUT_WORKING-DIRECTORY": "work",
+          INPUT_WORKFLOW: ".github/workflows/fork-kit.yml",
+          INPUT_REPORT: "result.json",
+        },
+      });
+      expect(p.status).toBe(0);
+      expect(readFileSync(out, "utf8")).toContain(`report=${join(realpathSync(r.tmp), "result.json")}`);
+      expect(JSON.parse(readFileSync(join(r.tmp, "result.json"), "utf8")).outcome).toBe("clean");
     } finally {
       r.cleanup();
     }

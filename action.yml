@@ -16,8 +16,21 @@ inputs:
       git pushes use the credentials actions/checkout stored, so check out with the
       same token. guard works with GITHUB_TOKEN (pull-requests: write, issues: write, statuses: write).
     required: true
+  repository:
+    description: >-
+      The fork (OWNER/NAME) when it is not the repository this workflow runs in. Used by a
+      central workflow that syncs many forks; see "Central sync" in the README.
+    default: ""
+  working-directory:
+    description: Where the fork is checked out, relative to the workspace (default the workspace).
+    default: ""
+  workflow:
+    description: >-
+      The fork's workflow file that runs fork-kit's guard (e.g. .github/workflows/fork-kit.yml),
+      so its runs are not counted as the fork branch's checks. Needed only with repository.
+    default: ""
   manifest:
-    description: Path to the manifest.
+    description: Path to the manifest, relative to working-directory.
     default: .fork-kit.toml
   dry-run:
     description: Decide, but push and change nothing (sync and guard).

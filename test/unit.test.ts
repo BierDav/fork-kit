@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GitHubForge, summarizeChecks } from "../src/forge.ts";
+import { GitHubForge, makeForge, summarizeChecks } from "../src/forge.ts";
 import { Failure } from "../src/git.ts";
 import { loadManifest } from "../src/manifest.ts";
 import { githubSlug, globMatch, md, naturalCompare } from "../src/text.ts";
@@ -159,6 +159,37 @@ describe("GitHubForge against a mock API", () => {
     delete process.env.GITHUB_WORKFLOW_REF;
   });
 
+  test("central mode: FORK_KIT_WORKFLOW names the fork's own workflow; another repository's is ignored", async () => {
+    routes.set("GET /repos/o/r/actions/runs", () => ({
+      total_count: 2,
+      workflow_runs: [
+        { id: 7, path: ".github/workflows/fork-kit.yml" },
+        { id: 8, path: ".github/workflows/ci.yml" },
+      ],
+    }));
+    routes.set("GET /repos/o/r/commits/abc/check-runs", () => ({
+      total_count: 2,
+      check_runs: [
+        { status: "completed", conclusion: "failure", details_url: "x/actions/runs/7/job/1" },
+        { status: "completed", conclusion: "success", details_url: "x/actions/runs/8/job/2" },
+      ],
+    }));
+    routes.set("GET /repos/o/r/commits/abc/status", () => ({ state: "success", statuses: [] }));
+    const forge = new GitHubForge("o/r", "t", base);
+
+    // The central workflow lives in another repository: its path means nothing in o/r.
+    process.env.GITHUB_WORKFLOW_REF = "central/fork-kit/.github/workflows/fork-kit.yml@refs/heads/main";
+    expect(await forge.checks("abc")).toBe("failure");
+
+    process.env.FORK_KIT_WORKFLOW = ".github/workflows/fork-kit.yml";
+    expect(await forge.checks("abc")).toBe("success");
+
+    delete process.env.FORK_KIT_WORKFLOW;
+    process.env.GITHUB_WORKFLOW_REF = "O/R/.github/workflows/fork-kit.yml@refs/heads/main";
+    expect(await forge.checks("abc")).toBe("success");
+    delete process.env.GITHUB_WORKFLOW_REF;
+  });
+
   test("auto-merge goes through GraphQL and reports failures", async () => {
     routes.set("GET /repos/o/r/pulls/3", () => ({ number: 3, node_id: "PR_3" }));
     let body = "";
@@ -195,5 +226,22 @@ describe("GitHubForge against a mock API", () => {
       labels: ["fork-kit:hold"],
       automerge: true,
     });
+  });
+});
+
+describe("makeForge", () => {
+  test("--repo wins over FORK_KIT_REPOSITORY, which wins over GITHUB_REPOSITORY", () => {
+    const saved = { ...process.env };
+    try {
+      delete process.env.FORK_KIT_FORGE;
+      process.env.GITHUB_REPOSITORY = "runner/central";
+      process.env.FORK_KIT_REPOSITORY = "env/fork";
+      expect((makeForge("flag/fork") as GitHubForge).owner).toBe("flag");
+      expect((makeForge() as GitHubForge).owner).toBe("env");
+      delete process.env.FORK_KIT_REPOSITORY;
+      expect((makeForge() as GitHubForge).repo).toBe("central");
+    } finally {
+      process.env = saved;
+    }
   });
 });
