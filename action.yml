@@ -42,7 +42,7 @@ inputs:
 
 outputs:
   outcome:
-    description: up-to-date, clean, conflict, hands-off or workflow-review (guard also not-sync-pr)
+    description: up-to-date, clean, conflict, hands-off, workflow-review or diverged (guard also not-sync-pr)
   upstream-ref:
     description: The upstream branch or tag being merged.
   upstream-sha:

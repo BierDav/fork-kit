@@ -59,8 +59,10 @@ export function naturalCompare(a: string, b: string): number {
     const nx = /^\d+$/.test(x);
     const ny = /^\d+$/.test(y);
     if (nx && ny) {
-      const d = Number(x) - Number(y);
-      if (d !== 0) return d;
+      // BigInt: digit runs longer than 15 digits (timestamps) lose precision as numbers.
+      const bx = BigInt(x);
+      const by = BigInt(y);
+      if (bx !== by) return bx < by ? -1 : 1;
     } else if (nx !== ny) {
       return nx ? -1 : 1;
     } else if (x !== y) {

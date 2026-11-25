@@ -270,6 +270,152 @@ describe("sync", () => {
     expect(r.state().prs[0]?.automerge).toBe(false);
   });
 
+  test("a forged fork-kit commit naming a non-upstream commit is someone else's", () => {
+    commit(r.upstream, "src/new.txt", "new\n", "upstream: new");
+    r.cli(["sync"]);
+    r.editState((s) => {
+      (s.prs[0] as { automerge: boolean }).automerge = true;
+    });
+    // X: the fork plus anything; Y: one parent X, X's tree, the trailer and the bot's identity.
+    git(r.work, ["fetch", "-q", "origin"]);
+    git(r.work, ["checkout", "-q", "-B", "forge", "origin/patched"]);
+    const x = commit(r.work, "src/evil.txt", "evil\n", "anything");
+    const tree = git(r.work, ["rev-parse", `${x}^{tree}`]);
+    const y = git(r.work, ["commit-tree", tree, "-p", x, "-m", `merge\n\nFork-Kit-Upstream: ${x}`], {
+      env: { GIT_COMMITTER_EMAIL: BOT_EMAIL, GIT_AUTHOR_EMAIL: BOT_EMAIL },
+    });
+    git(r.work, ["push", "-q", "--force", "origin", `${y}:refs/heads/fork-kit/sync`]);
+    const [res] = r.cli(["guard"]);
+    expect(res.outcome).toBe("hands-off");
+    expect(r.state().prs[0]?.automerge).toBe(false);
+  });
+
+  test("a push by anyone but the PR's author is someone else's, without consulting upstream", () => {
+    commit(r.upstream, "src/new.txt", "new\n", "upstream: new");
+    r.cli(["sync"]);
+    const path = join(r.tmp, "push-event.json");
+    writeFileSync(
+      path,
+      JSON.stringify({
+        action: "synchronize",
+        sender: { login: "mallory" },
+        pull_request: {
+          number: 1,
+          user: { login: "fork-kit-app[bot]" },
+          head: { ref: "fork-kit/sync", sha: r.syncSha() },
+          base: { ref: "patched" },
+          labels: [],
+          auto_merge: { merge_method: "merge" },
+        },
+      }),
+    );
+    // An unreachable upstream must not matter for this.
+    const manifest = join(r.work, ".fork-kit.toml");
+    writeFileSync(manifest, readFileSync(manifest, "utf8").replace(r.upstream, join(r.tmp, "gone")));
+    const [res] = r.cli(["guard"], { env: { GITHUB_EVENT_PATH: path } });
+    expect(res.outcome).toBe("hands-off");
+    expect(r.state().prs[0]?.automerge).toBe(false);
+    expect(r.state().prs[0]?.labels).toContain(LABEL_OWNER);
+  });
+
+  test("the guard fails closed when it cannot plan", () => {
+    commit(r.upstream, "src/new.txt", "new\n", "upstream: new");
+    r.cli(["sync"]);
+    expect(r.state().prs[0]?.automerge).toBe(true);
+    const manifest = join(r.work, ".fork-kit.toml");
+    writeFileSync(manifest, readFileSync(manifest, "utf8").replace(r.upstream, join(r.tmp, "gone")));
+    const [, proc] = r.cli(["guard"]);
+    expect(proc.status).toBe(2);
+    expect(r.state().prs[0]?.automerge).toBe(false);
+  });
+
+  test("a failure to turn auto-merge off fails the run", () => {
+    commit(r.upstream, "src/new.txt", "new\n", "upstream: new");
+    r.cli(["sync"]);
+    git(r.work, ["fetch", "-q", "origin"]);
+    git(r.work, ["checkout", "-q", "-B", "fork-kit/sync", "origin/fork-kit/sync"]);
+    commit(r.work, "src/human.txt", "human\n", "human");
+    git(r.work, ["push", "-q", "origin", "HEAD:refs/heads/fork-kit/sync"]);
+    r.editState((s) => {
+      (s as { failAutomerge?: boolean }).failAutomerge = true;
+    });
+    const [, proc] = r.cli(["guard"]);
+    expect(proc.status).toBe(2);
+    expect(proc.stderr).toContain("could not turn auto-merge off");
+  });
+
+  test("auto-merge names the commit fork-kit checked; a PR that can already merge is merged", () => {
+    commit(r.upstream, "src/new.txt", "new\n", "upstream: new");
+    r.cli(["sync"]);
+    const calls = r.state().calls as { call: string; enable?: boolean; headSha?: string }[];
+    expect(calls.find((c) => c.call === "automerge" && c.enable)?.headSha).toBe(r.syncSha());
+
+    r.editState((s) => {
+      Object.assign(s.prs[0] as object, { automerge: false, clean: true });
+    });
+    const [res] = r.cli(["sync"]);
+    expect(res.notes.some((n: string) => n.startsWith("merged #1"))).toBe(true);
+    expect(r.state().prs[0]?.state).toBe("merged");
+  });
+
+  test("an open sync PR is closed once upstream is merged some other way", () => {
+    commit(r.upstream, "src/new.txt", "new\n", "upstream: new");
+    r.cli(["sync"]);
+    git(r.work, ["fetch", "-q", "upstream"]);
+    git(r.work, ["checkout", "-q", "patched"]);
+    git(r.work, ["merge", "-q", "--no-edit", "upstream/main"]);
+    git(r.work, ["push", "-q", "origin", "patched"]);
+    const [res] = r.cli(["sync"]);
+    expect(res.outcome).toBe("up-to-date");
+    expect(r.state().prs[0]?.state).toBe("closed");
+  });
+
+  test("an upstream that does not contain the one merged last is held", () => {
+    const first = commit(r.upstream, "src/new.txt", "new\n", "upstream: new");
+    r.cli(["sync"]);
+    git(r.work, ["fetch", "-q", "origin"]);
+    git(r.work, ["checkout", "-q", "patched"]);
+    git(r.work, ["reset", "-q", "--hard", "origin/patched"]);
+    git(r.work, ["merge", "-q", "--no-ff", "--no-edit", "origin/fork-kit/sync"]);
+    git(r.work, ["push", "-q", "origin", "patched"]);
+    r.editState((s) => {
+      (s.prs[0] as { state: string }).state = "merged";
+    });
+    // Upstream main is force-moved to a line without `first`.
+    git(r.upstream, ["reset", "-q", "--hard", `${first}~1`]);
+    commit(r.upstream, "src/other.txt", "other\n", "upstream: other line");
+    const [res] = r.cli(["sync"]);
+    expect(res.outcome).toBe("diverged");
+    expect(res.automerge).toBe(false);
+    expect(r.state().prs).toHaveLength(1);
+  });
+
+  test("a conflict also holds for workflows the fork changed", () => {
+    git(r.work, ["checkout", "-q", "patched"]);
+    commit(r.upstream, ".github/workflows/ci.yml", "on: push\n", "upstream: ci");
+    git(r.work, ["fetch", "-q", "upstream"]);
+    git(r.work, ["merge", "-q", "--no-edit", "upstream/main"]);
+    commit(r.work, ".github/workflows/ci.yml", "on: pull_request\n", "fork: harden ci");
+    git(r.work, ["push", "-q", "origin", "patched"]);
+    commit(r.upstream, "src/hello.txt", "hi\nworld\n", "upstream: hi");
+    const [res] = r.cli(["sync"]);
+    expect(res.outcome).toBe("workflow-review");
+    expect(res.workflow_changes).toEqual([".github/workflows/ci.yml"]);
+  });
+
+  test("resolve keeps local commits that are not on origin", () => {
+    commit(r.upstream, "src/hello.txt", "hi\nworld\n", "upstream: hi");
+    r.cli(["sync"]);
+    r.cli(["resolve"]);
+    writeFileSync(join(r.work, "src/hello.txt"), "hallo hi\nworld\n");
+    git(r.work, ["commit", "-qam", "half done"]);
+    const local = git(r.work, ["rev-parse", "HEAD"]);
+    const [, proc] = r.cli(["resolve"]);
+    expect(proc.status).toBe(2);
+    expect(proc.stderr).toContain("not on origin's");
+    expect(git(r.work, ["rev-parse", "fork-kit/sync"])).toBe(local);
+  });
+
   test("a dry run pushes nothing", () => {
     commit(r.upstream, "src/new.txt", "new\n", "upstream: new");
     const [res] = r.cli(["sync", "--dry-run"]);
@@ -444,6 +590,37 @@ describe("ledger", () => {
       expect(proc.status).toBe(1);
       expect(res.ledger.uncovered).toEqual(["src/untracked.txt"]);
       expect(res.ledger.stale).toEqual(["gone"]);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  test("a manifest outside the repository root is not counted as a change", () => {
+    const r = new Repos();
+    try {
+      git(r.work, ["mv", ".fork-kit.toml", "ci.fork-kit.toml"]);
+      run(r.work, ["mkdir", "ci"]);
+      git(r.work, ["mv", "ci.fork-kit.toml", "ci/.fork-kit.toml"]);
+      git(r.work, ["commit", "-qm", "fork: move the manifest"]);
+      git(r.work, ["push", "-q", "origin", "patched"]);
+      const [res, proc] = r.cli(["--manifest", "ci/.fork-kit.toml", "ledger", "--strict"]);
+      expect(res.ledger.uncovered).toEqual([]);
+      expect(proc.status).toBe(0);
+    } finally {
+      r.cleanup();
+    }
+  });
+});
+
+describe("workflow_changes = push", () => {
+  test("upstream workflow changes neither hold the push nor block auto-merge", () => {
+    const r = new Repos("branch:main", 'workflow_changes = "push"');
+    try {
+      commit(r.upstream, ".github/workflows/ci.yml", "on: push\n", "upstream: ci");
+      const [res] = r.cli(["sync"]);
+      expect(res.outcome).toBe("clean");
+      expect(res.automerge).toBe(true);
+      expect(r.state().prs[0]?.labels).toEqual([LABEL_WORKFLOWS]);
     } finally {
       r.cleanup();
     }

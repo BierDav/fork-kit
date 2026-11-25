@@ -5502,9 +5502,10 @@ function naturalCompare(a, b) {
     const nx = /^\d+$/.test(x);
     const ny = /^\d+$/.test(y);
     if (nx && ny) {
-      const d = Number(x) - Number(y);
-      if (d !== 0)
-        return d;
+      const bx = BigInt(x);
+      const by = BigInt(y);
+      if (bx !== by)
+        return bx < by ? -1 : 1;
     } else if (nx !== ny) {
       return nx ? -1 : 1;
     } else if (x !== y) {
@@ -5615,15 +5616,30 @@ class GitHubForge {
       }
     }
   }
-  async automerge(num, enable) {
+  async automerge(num, enable, headSha) {
     try {
       const { data } = await this.octokit.rest.pulls.get({ ...this.r, pull_number: num });
-      const mutation = enable ? "mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: MERGE}) { clientMutationId } }" : "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }";
-      await this.octokit.graphql(mutation, { id: data.node_id });
+      if (enable) {
+        await this.octokit.graphql("mutation($id: ID!, $head: GitObjectID) { enablePullRequestAutoMerge(input: " + "{pullRequestId: $id, mergeMethod: MERGE, expectedHeadOid: $head}) { clientMutationId } }", { id: data.node_id, head: headSha ?? null });
+      } else {
+        await this.octokit.graphql("mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }", { id: data.node_id });
+      }
       return null;
     } catch (e) {
       return e.message;
     }
+  }
+  async merge(num, headSha) {
+    try {
+      await this.octokit.rest.pulls.merge({ ...this.r, pull_number: num, sha: headSha, merge_method: "merge" });
+      return null;
+    } catch (e) {
+      return e.message;
+    }
+  }
+  async close(num, comment) {
+    await this.comment(num, comment);
+    await this.octokit.rest.pulls.update({ ...this.r, pull_number: num, state: "closed" });
   }
   async comments(num) {
     const all = await this.octokit.paginate(this.octokit.rest.issues.listComments, {
@@ -5655,9 +5671,16 @@ class GitHubForge {
         ref: sha,
         per_page: 100
       });
-      const { data: combined } = await this.octokit.rest.repos.getCombinedStatusForRef({ ...this.r, ref: sha });
+      const { data: combined } = await this.octokit.rest.repos.getCombinedStatusForRef({
+        ...this.r,
+        ref: sha,
+        per_page: 100
+      });
       const ownUrls = [...own].map((id) => `/actions/runs/${id}/`);
       const items = runs.filter((r) => !ownUrls.some((u) => (r.details_url ?? "").includes(u))).map((r) => [r.status, r.conclusion]);
+      if (combined.total_count > combined.statuses.length) {
+        items.push(combined.state === "success" ? ["completed", "success"] : combined.state === "pending" ? ["queued", null] : ["completed", "failure"]);
+      }
       for (const s of combined.statuses) {
         if (s.context === STATUS_HOLD)
           continue;
@@ -5732,10 +5755,30 @@ class FakeForge {
     pr.labels = [...new Set([...pr.labels, ...add])].filter((l) => !remove.includes(l)).sort();
     this.save("labels", { number: num, add, remove });
   }
-  async automerge(num, enable) {
-    this.get(num).automerge = enable;
-    this.save("automerge", { number: num, enable });
+  async automerge(num, enable, headSha) {
+    const pr = this.get(num);
+    if (this.state.failAutomerge) {
+      this.save("automerge", { number: num, enable, headSha, error: "forced failure" });
+      return "forced failure";
+    }
+    if (enable && pr.clean) {
+      this.save("automerge", { number: num, enable, headSha, error: "clean status" });
+      return "Pull request is in clean status";
+    }
+    pr.automerge = enable;
+    this.save("automerge", { number: num, enable, headSha });
     return null;
+  }
+  async merge(num, headSha) {
+    this.get(num).state = "merged";
+    this.save("merge", { number: num, headSha });
+    return null;
+  }
+  async close(num, comment) {
+    const pr = this.get(num);
+    pr.comments.push(comment);
+    pr.state = "closed";
+    this.save("close", { number: num });
   }
   async comments(num) {
     return [...this.get(num).comments];
@@ -5811,9 +5854,11 @@ function fetchFork(m) {
   git(["fetch", "--quiet", "--no-tags", "origin", `+refs/heads/${m.syncBranch}:refs/fork-kit-state/sync`]);
   return [fork, git(["rev-parse", "refs/fork-kit-state/sync"])];
 }
-function classifySync(sync, fork) {
+function classifySync(sync, fork, upstream) {
   const recorded = trailerValue(sync, TRAILER);
   if (!recorded || !gitOk(["cat-file", "-e", `${recorded}^{commit}`]))
+    return "foreign";
+  if (!gitOk(["merge-base", "--is-ancestor", recorded, upstream]))
     return "foreign";
   if (git(["log", "-1", "--format=%ce", sync]) !== identity().GIT_COMMITTER_EMAIL)
     return "foreign";
@@ -5830,6 +5875,14 @@ function classifySync(sync, fork) {
   }
   return "foreign";
 }
+function lastMergedUpstream(fork) {
+  const value = git(["log", "-n", "1", "--grep", `^${TRAILER}: `, `--format=%(trailers:key=${TRAILER},valueonly)`, fork], {
+    check: false
+  }).trim();
+  if (!/^[0-9a-f]{40,64}$/.test(value) || !gitOk(["cat-file", "-e", `${value}^{commit}`]))
+    return null;
+  return value;
+}
 async function plan(m, forge) {
   const [major, minor] = gitVersion();
   if (major < MIN_GIT[0] || major === MIN_GIT[0] && minor < MIN_GIT[1]) {
@@ -5840,7 +5893,7 @@ async function plan(m, forge) {
   }
   const [ref, up] = await resolveUpstream(m, forge);
   const [fork, sync] = fetchFork(m);
-  const syncState = sync === null ? "none" : classifySync(sync, fork);
+  const syncState = sync === null ? "none" : classifySync(sync, fork, up);
   const base0 = { upstreamRef: ref, upstreamSha: up, forkSha: fork, syncSha: sync, syncState, notes: [] };
   if (gitOk(["merge-base", "--is-ancestor", up, fork])) {
     return {
@@ -5858,9 +5911,37 @@ async function plan(m, forge) {
   const behind = revList(up, `^${fork}`).length;
   const workflowChanges = gitPaths(["diff", "--name-only", "--no-renames", base, up, "--", ".github"]);
   const conflicts = mergeTree(fork, up).conflicts.map((path) => ({ path, patches: patchesFor(m, path) }));
+  if (conflicts.length) {
+    const forkChanged = gitPaths([
+      "diff",
+      "--name-only",
+      "--no-renames",
+      "--diff-filter=AM",
+      fork,
+      up,
+      "--",
+      ".github"
+    ]);
+    workflowChanges.push(...forkChanged.filter((f) => !workflowChanges.includes(f)));
+    workflowChanges.sort();
+  }
   let outcome = conflicts.length ? "conflict" : "clean";
   if (syncState === "foreign")
     outcome = "hands-off";
+  const last = lastMergedUpstream(fork);
+  if (last && !gitOk(["merge-base", "--is-ancestor", last, up])) {
+    return {
+      ...base0,
+      outcome: "diverged",
+      base,
+      behind,
+      conflicts: [],
+      workflowChanges: [],
+      notes: [
+        `upstream ${ref} (${up.slice(0, 8)}) does not contain ${last.slice(0, 8)}, the upstream ${m.branch} last merged; nothing pushed`
+      ]
+    };
+  }
   const p = { ...base0, outcome, base, behind, conflicts, workflowChanges };
   if (syncState === "stale") {
     p.notes.push(`the sync branch was built on a ${m.branch} commit that is no longer on ${m.branch}; rebuilding`);
@@ -5869,7 +5950,7 @@ async function plan(m, forge) {
 }
 
 // src/commands.ts
-var VERSION10 = "0.3.0";
+var VERSION10 = "0.3.1";
 var SCHEMA = 1;
 var MARKER = "<!-- fork-kit -->";
 function reportBase(command, m, p) {
@@ -5943,14 +6024,33 @@ function prBody(m, p, baseline, automerge, whyNot) {
 `)}
 `;
 }
+async function automergeOff(forge, num) {
+  const err = await forge.automerge(num, false);
+  if (err)
+    throw new Failure(`could not turn auto-merge off on #${num}: ${err}`);
+}
 async function sync(m, forge, opts) {
   const p = await plan(m, forge);
   const result = reportBase("sync", m, p);
   if (p.outcome === "up-to-date") {
     result.notes.push("upstream is already merged");
+    const open = await forge.findPr(m.syncBranch, m.branch);
+    if (open && p.syncState !== "foreign" && !opts.dryRun) {
+      await forge.close(open.number, `${p.upstreamRef} (\`${p.upstreamSha.slice(0, 8)}\`) is already merged into \`${m.branch}\`; closing this sync PR.`);
+      result.notes.push(`closed #${open.number}: ${m.branch} already has this upstream`);
+    }
     return result;
   }
   let pr = await forge.findPr(m.syncBranch, m.branch);
+  if (p.outcome === "diverged") {
+    if (pr) {
+      result.pr = prRef(pr);
+      if (pr.automerge && !opts.dryRun)
+        await automergeOff(forge, pr.number);
+    }
+    result.automerge = false;
+    return result;
+  }
   if (p.outcome === "hands-off") {
     if (pr === null) {
       p.syncState = "stale";
@@ -5972,7 +6072,7 @@ Upstream moved to **${p.upstreamRef}** (\`${p.upstreamSha.slice(0, 8)}\`). This 
       }
       if (!opts.dryRun) {
         if (pr.automerge)
-          await forge.automerge(pr.number, false);
+          await automergeOff(forge, pr.number);
         if (!pr.labels.includes(LABEL_OWNER))
           await forge.labels(pr.number, [LABEL_OWNER], []);
       }
@@ -5990,9 +6090,11 @@ Upstream moved to **${p.upstreamRef}** (\`${p.upstreamSha.slice(0, 8)}\`). This 
     whyNot.push("disabled in the manifest");
   if (pr?.labels.includes(LABEL_HOLD))
     whyNot.push(`held with the ${LABEL_HOLD} label`);
+  if (pr?.labels.includes(LABEL_OWNER))
+    whyNot.push(`marked ${LABEL_OWNER}`);
   if (p.conflicts.length)
     whyNot.push("merge conflicts");
-  if (p.workflowChanges.length)
+  if (p.workflowChanges.length && m.workflowChanges === "hold")
     whyNot.push("upstream changed .github/");
   if (baseline === "failure")
     whyNot.push(`\`${m.branch}\` itself is failing its checks`);
@@ -6004,8 +6106,10 @@ Upstream moved to **${p.upstreamRef}** (\`${p.upstreamSha.slice(0, 8)}\`). This 
     result.notes.push("dry run: nothing pushed");
     return result;
   }
+  let head = p.syncSha ?? "";
   if (!syncCurrent(p)) {
     const commit = buildSyncCommit(m, p);
+    head = commit;
     const lease = `--force-with-lease=refs/heads/${m.syncBranch}:${p.syncSha ?? ""}`;
     git(["push", "--quiet", lease, "origin", `${commit}:refs/heads/${m.syncBranch}`]);
     if (result.sync_branch)
@@ -6025,11 +6129,20 @@ Upstream moved to **${p.upstreamRef}** (\`${p.upstreamSha.slice(0, 8)}\`). This 
   ];
   const labels = pr.labels;
   await forge.labels(pr.number, want.filter(([l, on]) => on && !labels.includes(l)).map(([l]) => l), want.filter(([l, on]) => !on && labels.includes(l)).map(([l]) => l));
-  if (pr.automerge !== automerge) {
-    const err = await forge.automerge(pr.number, automerge);
-    if (err) {
-      result.automerge = pr.automerge;
-      result.notes.push(`could not ${automerge ? "enable" : "disable"} auto-merge: ${err}`);
+  if (!automerge && pr.automerge)
+    await automergeOff(forge, pr.number);
+  if (automerge && !pr.automerge) {
+    const err = await forge.automerge(pr.number, true, head);
+    if (err && /\b(clean|unstable) status\b/i.test(err)) {
+      const mergeErr = await forge.merge(pr.number, head);
+      if (mergeErr)
+        result.notes.push(`could not merge: ${mergeErr}`);
+      else
+        result.notes.push(`merged #${pr.number}: its required checks had passed`);
+      result.automerge = mergeErr === null;
+    } else if (err) {
+      result.automerge = false;
+      result.notes.push(`could not enable auto-merge: ${err}`);
     }
   }
   result.pr = prRef(pr);
@@ -6052,7 +6165,12 @@ function eventPr(path = process.env.GITHUB_EVENT_PATH) {
   if (typeof head.sha !== "string" || typeof head.ref !== "string" || typeof base.ref !== "string")
     return null;
   const labels = Array.isArray(pr.labels) ? pr.labels : [];
+  const e = event;
+  const user = pr.user ?? {};
   return {
+    action: typeof e.action === "string" ? e.action : "",
+    sender: typeof e.sender?.login === "string" ? e.sender.login : "",
+    author: typeof user.login === "string" ? user.login : "",
     number: pr.number,
     headSha: head.sha,
     headRef: head.ref,
@@ -6069,7 +6187,7 @@ async function guard(m, forge, opts) {
     if (!opts.dryRun) {
       await forge.setStatus(event.headSha, held ? "failure" : "success", held ? `Held: remove the ${LABEL_HOLD} label to merge` : `Not held (add ${LABEL_HOLD} to hold)`);
       if (held && event.automerge)
-        await forge.automerge(event.number, false);
+        await automergeOff(forge, event.number);
     }
     notes.push(held ? `#${event.number} is held with ${LABEL_HOLD}: ${STATUS_HOLD} fails and auto-merge is off` : `#${event.number} is not held: ${STATUS_HOLD} passes`);
   }
@@ -6087,7 +6205,35 @@ async function guard(m, forge, opts) {
       notes: [...notes, `${headRef} is not ${m.syncBranch}`]
     };
   }
-  const p = await plan(m, forge);
+  if (event && event.action === "synchronize" && event.author && event.sender !== event.author) {
+    const pr = await forge.findPr(m.syncBranch, m.branch);
+    if (pr && !opts.dryRun) {
+      if (pr.automerge)
+        await automergeOff(forge, pr.number);
+      if (!pr.labels.includes(LABEL_OWNER))
+        await forge.labels(pr.number, [LABEL_OWNER], []);
+    }
+    return {
+      schema: SCHEMA,
+      tool: `fork-kit ${VERSION10}`,
+      command: "guard",
+      outcome: "hands-off",
+      conflicts: [],
+      workflow_changes: [],
+      pr: pr ? prRef(pr) : null,
+      automerge: false,
+      notes: [...notes, `${event.sender} pushed to the sync PR, which ${event.author} opened: auto-merge off`]
+    };
+  }
+  let p;
+  try {
+    p = await plan(m, forge);
+  } catch (e) {
+    const pr = await forge.findPr(m.syncBranch, m.branch);
+    if (pr?.automerge && !opts.dryRun)
+      await automergeOff(forge, pr.number);
+    throw e;
+  }
   const result = reportBase("guard", m, p);
   result.notes.push(...notes);
   const pr = await forge.findPr(m.syncBranch, m.branch);
@@ -6104,7 +6250,7 @@ async function guard(m, forge, opts) {
   Object.assign(result, { outcome: "hands-off", automerge: false });
   if (!opts.dryRun) {
     if (pr.automerge)
-      await forge.automerge(pr.number, false);
+      await automergeOff(forge, pr.number);
     if (!pr.labels.includes(LABEL_OWNER))
       await forge.labels(pr.number, [LABEL_OWNER], []);
   }
@@ -6136,6 +6282,10 @@ async function resolve(m, forge) {
   const result = reportBase("resolve", m, p);
   if (p.syncSha === null)
     throw new Failure(`origin has no ${m.syncBranch}; run fork-kit sync first`);
+  const local = `refs/heads/${m.syncBranch}`;
+  if (gitOk(["rev-parse", "--verify", "--quiet", local]) && git(["rev-list", "-n", "1", local, `^${p.syncSha}`])) {
+    throw new Failure(`your local ${m.syncBranch} has commits that are not on origin's; push them (git push origin HEAD:${local}) or delete the branch first`);
+  }
   git(["checkout", "--quiet", "-B", m.syncBranch, p.syncSha]);
   const merged = spawnSync3("git", ["merge", "--no-ff", "--no-edit", p.forkSha], { encoding: "utf8" });
   if (merged.status === 0) {
@@ -6167,7 +6317,7 @@ async function resolve(m, forge) {
 
 // src/manifest.ts
 import { existsSync as existsSync2, readFileSync as readFileSync3 } from "node:fs";
-import { basename } from "node:path";
+import { basename, relative, resolve as resolve2 } from "node:path";
 
 // node_modules/smol-toml/dist/error.js
 /*!
@@ -7142,6 +7292,11 @@ var HAS_WELLFORMED = !!"".isWellFormed;
 // src/manifest.ts
 var isTable = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 var isStrings = (v) => Array.isArray(v) && v.every((x) => typeof x === "string");
+function repoPath(path) {
+  const top = git(["rev-parse", "--show-toplevel"], { check: false });
+  const rel = top ? relative(top, resolve2(path)) : "";
+  return rel && !rel.startsWith("..") ? rel.split("\\").join("/") : basename(path);
+}
 function loadManifest(path) {
   if (!existsSync2(path))
     throw new Failure(`no manifest at ${path}`);
@@ -7162,6 +7317,17 @@ function loadManifest(path) {
   };
   const up = isTable(data.upstream) ? data.upstream : {};
   const fork = isTable(data.fork) ? data.fork : {};
+  const known = [
+    ["the top level", data, ["upstream", "fork", "ledger", "patch"]],
+    ["[upstream]", up, ["url", "track"]],
+    ["[fork]", fork, ["branch", "sync_branch", "automerge", "workflow_changes"]],
+    ["[ledger]", isTable(data.ledger) ? data.ledger : {}, ["ignore"]]
+  ];
+  for (const [where, table, keys] of known) {
+    const unknown = Object.keys(table).filter((k) => !keys.includes(k));
+    if (unknown.length)
+      errors.push(`${where}: unknown keys ${unknown.sort().join(", ")}`);
+  }
   const url = str(up, "url", "[upstream]");
   const track = str(up, "track", "[upstream]");
   if (!url)
@@ -7246,7 +7412,7 @@ function loadManifest(path) {
     syncBranch,
     automerge: automerge === true,
     workflowChanges,
-    ignore: [...isStrings(ignore) ? ignore : [], basename(path)],
+    ignore: [...isStrings(ignore) ? ignore : [], repoPath(path)],
     patches,
     path
   };

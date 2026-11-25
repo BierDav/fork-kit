@@ -20,7 +20,14 @@ import { naturalCompare, patchesFor, SAFE_REF } from "./text.ts";
 export const TRAILER = "Fork-Kit-Upstream";
 const UPSTREAM_REF = "refs/fork-kit-state/upstream";
 
-export type Outcome = "up-to-date" | "clean" | "conflict" | "hands-off" | "workflow-review" | "not-sync-pr";
+export type Outcome =
+  | "up-to-date"
+  | "clean"
+  | "conflict"
+  | "hands-off"
+  | "workflow-review"
+  | "diverged"
+  | "not-sync-pr";
 export type SyncState = "none" | "pure" | "stale" | "foreign";
 
 export interface Conflict {
@@ -88,11 +95,14 @@ function fetchFork(m: Manifest): [string, string | null] {
  * What the sync branch head is. "pure": exactly the commit fork-kit would build (its trailer, its committer,
  * upstream plus a commit already on the fork branch as parents, and the tree fork-kit computes for them).
  * "stale": the same, but its fork parent is no longer on the fork branch (force-moved). "foreign": anything
- * else, i.e. someone else's work.
+ * else, i.e. someone else's work. The trailer, committer and parents can be forged by anyone who can push,
+ * so the recorded upstream must also be upstream's commit (or an older one of upstream's): then the whole
+ * commit follows from trusted inputs.
  */
-export function classifySync(sync: string, fork: string): SyncState {
+export function classifySync(sync: string, fork: string, upstream: string): SyncState {
   const recorded = trailerValue(sync, TRAILER);
   if (!recorded || !gitOk(["cat-file", "-e", `${recorded}^{commit}`])) return "foreign";
+  if (!gitOk(["merge-base", "--is-ancestor", recorded, upstream])) return "foreign";
   if (git(["log", "-1", "--format=%ce", sync]) !== identity().GIT_COMMITTER_EMAIL) return "foreign";
   const parents = parentsOf(sync);
   const tree = git(["rev-parse", `${sync}^{tree}`]);
@@ -107,6 +117,18 @@ export function classifySync(sync: string, fork: string): SyncState {
   return "foreign";
 }
 
+/** The upstream commit named by the newest fork-kit merge in the fork's history, if fork-kit merged before. */
+function lastMergedUpstream(fork: string): string | null {
+  const value = git(
+    ["log", "-n", "1", "--grep", `^${TRAILER}: `, `--format=%(trailers:key=${TRAILER},valueonly)`, fork],
+    {
+      check: false,
+    },
+  ).trim();
+  if (!/^[0-9a-f]{40,64}$/.test(value) || !gitOk(["cat-file", "-e", `${value}^{commit}`])) return null;
+  return value;
+}
+
 export async function plan(m: Manifest, forge: Forge): Promise<Plan> {
   const [major, minor] = gitVersion();
   if (major < MIN_GIT[0] || (major === MIN_GIT[0] && minor < MIN_GIT[1])) {
@@ -117,7 +139,7 @@ export async function plan(m: Manifest, forge: Forge): Promise<Plan> {
   }
   const [ref, up] = await resolveUpstream(m, forge);
   const [fork, sync] = fetchFork(m);
-  const syncState: SyncState = sync === null ? "none" : classifySync(sync, fork);
+  const syncState: SyncState = sync === null ? "none" : classifySync(sync, fork, up);
   const base0 = { upstreamRef: ref, upstreamSha: up, forkSha: fork, syncSha: sync, syncState, notes: [] as string[] };
   if (gitOk(["merge-base", "--is-ancestor", up, fork])) {
     return {
@@ -134,8 +156,40 @@ export async function plan(m: Manifest, forge: Forge): Promise<Plan> {
   const behind = revList(up, `^${fork}`).length;
   const workflowChanges = gitPaths(["diff", "--name-only", "--no-renames", base, up, "--", ".github"]);
   const conflicts = mergeTree(fork, up).conflicts.map((path) => ({ path, patches: patchesFor(m, path) }));
+  if (conflicts.length) {
+    // A conflict pushes upstream's tree as it is, so upstream's version of every workflow the fork changed
+    // runs on the sync branch too, not only the files upstream changed.
+    const forkChanged = gitPaths([
+      "diff",
+      "--name-only",
+      "--no-renames",
+      "--diff-filter=AM",
+      fork,
+      up,
+      "--",
+      ".github",
+    ]);
+    workflowChanges.push(...forkChanged.filter((f) => !workflowChanges.includes(f)));
+    workflowChanges.sort();
+  }
   let outcome: Outcome = conflicts.length ? "conflict" : "clean";
   if (syncState === "foreign") outcome = "hands-off";
+  // The upstream merged last must be part of the new one: a backport release marked latest, a force-pushed
+  // branch or a moved tag would otherwise merge an older line into the fork.
+  const last = lastMergedUpstream(fork);
+  if (last && !gitOk(["merge-base", "--is-ancestor", last, up])) {
+    return {
+      ...base0,
+      outcome: "diverged",
+      base,
+      behind,
+      conflicts: [],
+      workflowChanges: [],
+      notes: [
+        `upstream ${ref} (${up.slice(0, 8)}) does not contain ${last.slice(0, 8)}, the upstream ${m.branch} last merged; nothing pushed`,
+      ],
+    };
+  }
   const p: Plan = { ...base0, outcome, base, behind, conflicts, workflowChanges };
   if (syncState === "stale") {
     p.notes.push(`the sync branch was built on a ${m.branch} commit that is no longer on ${m.branch}; rebuilding`);

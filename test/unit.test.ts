@@ -23,6 +23,11 @@ describe("text", () => {
 
   test("natural order", () => {
     expect(["v1.9", "v1.10", "v1.2"].sort(naturalCompare)).toEqual(["v1.2", "v1.9", "v1.10"]);
+    // Beyond Number's precision: these differ only in the last digit.
+    expect(["v20261125000000000002", "v20261125000000000001"].sort(naturalCompare)).toEqual([
+      "v20261125000000000001",
+      "v20261125000000000002",
+    ]);
   });
 
   test("github slugs", () => {
@@ -65,7 +70,7 @@ describe("manifest", () => {
       const p = join(dir, "m.toml");
       writeFileSync(
         p,
-        `[upstream]\ntrack = "sometimes"\n[fork]\nbranch = "x"\nsync_branch = "x"\nworkflow_changes = "maybe"\n[[patch]]\nid = "Bad Id"\n`,
+        `[upstream]\ntrack = "sometimes"\n[fork]\nbranch = "x"\nsync_branch = "x"\nworkflow_changes = "maybe"\nauto_merge = false\n[[patch]]\nid = "Bad Id"\n`,
       );
       let msg = "";
       try {
@@ -81,6 +86,7 @@ describe("manifest", () => {
         "workflow_changes must be",
         "id must match",
         "paths is required",
+        "[fork]: unknown keys auto_merge",
       ]) {
         expect(msg).toContain(needle);
       }

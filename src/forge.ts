@@ -24,8 +24,14 @@ export interface Forge {
   createPr(head: string, base: string, title: string, body: string): Promise<PR>;
   updatePr(num: number, title: string, body: string): Promise<void>;
   labels(num: number, add: string[], remove: string[]): Promise<void>;
-  /** Returns an error message, or null on success. */
-  automerge(num: number, enable: boolean): Promise<string | null>;
+  /**
+   * Turns auto-merge on or off; returns an error message, or null on success. Turning it on names the head
+   * commit fork-kit checked, so GitHub refuses when someone pushed since.
+   */
+  automerge(num: number, enable: boolean, headSha?: string): Promise<string | null>;
+  /** Merges now (merge commit), only if the head is still headSha; returns an error message, or null. */
+  merge(num: number, headSha: string): Promise<string | null>;
+  close(num: number, comment: string): Promise<void>;
   comments(num: number): Promise<string[]>;
   comment(num: number, body: string): Promise<void>;
   checks(sha: string): Promise<CheckState>;
@@ -144,17 +150,39 @@ export class GitHubForge implements Forge {
     }
   }
 
-  async automerge(num: number, enable: boolean): Promise<string | null> {
+  async automerge(num: number, enable: boolean, headSha?: string): Promise<string | null> {
     try {
       const { data } = await this.octokit.rest.pulls.get({ ...this.r, pull_number: num });
-      const mutation = enable
-        ? "mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: MERGE}) { clientMutationId } }"
-        : "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }";
-      await this.octokit.graphql(mutation, { id: data.node_id });
+      if (enable) {
+        await this.octokit.graphql(
+          "mutation($id: ID!, $head: GitObjectID) { enablePullRequestAutoMerge(input: " +
+            "{pullRequestId: $id, mergeMethod: MERGE, expectedHeadOid: $head}) { clientMutationId } }",
+          { id: data.node_id, head: headSha ?? null },
+        );
+      } else {
+        await this.octokit.graphql(
+          "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }",
+          { id: data.node_id },
+        );
+      }
       return null;
     } catch (e) {
       return (e as Error).message;
     }
+  }
+
+  async merge(num: number, headSha: string): Promise<string | null> {
+    try {
+      await this.octokit.rest.pulls.merge({ ...this.r, pull_number: num, sha: headSha, merge_method: "merge" });
+      return null;
+    } catch (e) {
+      return (e as Error).message;
+    }
+  }
+
+  async close(num: number, comment: string): Promise<void> {
+    await this.comment(num, comment);
+    await this.octokit.rest.pulls.update({ ...this.r, pull_number: num, state: "closed" });
   }
 
   async comments(num: number): Promise<string[]> {
@@ -190,11 +218,25 @@ export class GitHubForge implements Forge {
         ref: sha,
         per_page: 100,
       });
-      const { data: combined } = await this.octokit.rest.repos.getCombinedStatusForRef({ ...this.r, ref: sha });
+      const { data: combined } = await this.octokit.rest.repos.getCombinedStatusForRef({
+        ...this.r,
+        ref: sha,
+        per_page: 100,
+      });
       const ownUrls = [...own].map((id) => `/actions/runs/${id}/`);
       const items: [string, string | null][] = runs
         .filter((r) => !ownUrls.some((u) => (r.details_url ?? "").includes(u)))
         .map((r) => [r.status, r.conclusion]);
+      // More statuses than one page: fall back to GitHub's combined state for all of them.
+      if (combined.total_count > combined.statuses.length) {
+        items.push(
+          combined.state === "success"
+            ? ["completed", "success"]
+            : combined.state === "pending"
+              ? ["queued", null]
+              : ["completed", "failure"],
+        );
+      }
       for (const s of combined.statuses) {
         if (s.context === STATUS_HOLD) continue;
         if (s.state === "failure" || s.state === "error") items.push(["completed", "failure"]);
@@ -219,6 +261,8 @@ interface FakePr extends PR {
   body: string;
   comments: string[];
   state: string;
+  /** Test hook: GitHub would refuse auto-merge because the PR can already merge. */
+  clean?: boolean;
 }
 
 interface FakeState {
@@ -227,6 +271,8 @@ interface FakeState {
   releases?: Record<string, string>;
   checks?: Record<string, CheckState>;
   statuses?: Record<string, string>;
+  /** Test hook: every auto-merge call fails. */
+  failAutomerge?: boolean;
 }
 
 /** A forge kept in a JSON file, for tests and local experiments. */
@@ -289,10 +335,32 @@ export class FakeForge implements Forge {
     this.save("labels", { number: num, add, remove });
   }
 
-  async automerge(num: number, enable: boolean) {
-    this.get(num).automerge = enable;
-    this.save("automerge", { number: num, enable });
+  async automerge(num: number, enable: boolean, headSha?: string) {
+    const pr = this.get(num);
+    if (this.state.failAutomerge) {
+      this.save("automerge", { number: num, enable, headSha, error: "forced failure" });
+      return "forced failure";
+    }
+    if (enable && pr.clean) {
+      this.save("automerge", { number: num, enable, headSha, error: "clean status" });
+      return "Pull request is in clean status";
+    }
+    pr.automerge = enable;
+    this.save("automerge", { number: num, enable, headSha });
     return null;
+  }
+
+  async merge(num: number, headSha: string) {
+    this.get(num).state = "merged";
+    this.save("merge", { number: num, headSha });
+    return null;
+  }
+
+  async close(num: number, comment: string) {
+    const pr = this.get(num);
+    pr.comments.push(comment);
+    pr.state = "closed";
+    this.save("close", { number: num });
   }
 
   async comments(num: number) {

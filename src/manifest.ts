@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { existsSync, readFileSync } from "node:fs";
-import { basename } from "node:path";
+import { basename, relative, resolve } from "node:path";
 import { parse } from "smol-toml";
-import { Failure } from "./git.ts";
+import { Failure, git } from "./git.ts";
 import { githubSlug, SAFE_REF } from "./text.ts";
 
 export interface Patch {
@@ -34,6 +34,13 @@ type Table = Record<string, unknown>;
 const isTable = (v: unknown): v is Table => typeof v === "object" && v !== null && !Array.isArray(v);
 const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string");
 
+/** The manifest's path inside the repository, so the ledger never counts it as a change. */
+function repoPath(path: string): string {
+  const top = git(["rev-parse", "--show-toplevel"], { check: false });
+  const rel = top ? relative(top, resolve(path)) : "";
+  return rel && !rel.startsWith("..") ? rel.split("\\").join("/") : basename(path);
+}
+
 export function loadManifest(path: string): Manifest {
   if (!existsSync(path)) throw new Failure(`no manifest at ${path}`);
   let data: Table;
@@ -53,6 +60,17 @@ export function loadManifest(path: string): Manifest {
   };
   const up = isTable(data.upstream) ? data.upstream : {};
   const fork = isTable(data.fork) ? data.fork : {};
+  // A misspelt key (auto_merge for automerge) must not silently fall back to a default.
+  const known: [string, Table, string[]][] = [
+    ["the top level", data, ["upstream", "fork", "ledger", "patch"]],
+    ["[upstream]", up, ["url", "track"]],
+    ["[fork]", fork, ["branch", "sync_branch", "automerge", "workflow_changes"]],
+    ["[ledger]", isTable(data.ledger) ? data.ledger : {}, ["ignore"]],
+  ];
+  for (const [where, table, keys] of known) {
+    const unknown = Object.keys(table).filter((k) => !keys.includes(k));
+    if (unknown.length) errors.push(`${where}: unknown keys ${unknown.sort().join(", ")}`);
+  }
 
   const url = str(up, "url", "[upstream]");
   const track = str(up, "track", "[upstream]");
@@ -127,7 +145,7 @@ export function loadManifest(path: string): Manifest {
     syncBranch,
     automerge: automerge === true,
     workflowChanges: workflowChanges as Manifest["workflowChanges"],
-    ignore: [...(isStrings(ignore) ? ignore : []), basename(path)],
+    ignore: [...(isStrings(ignore) ? ignore : []), repoPath(path)],
     patches,
     path,
   };

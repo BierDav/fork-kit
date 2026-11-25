@@ -34,8 +34,13 @@ On each run, `fork-kit sync`:
 
 1. Resolves the upstream ref and fetches it, along with your fork branch and
    `fork-kit/sync`.
-2. If upstream is already merged, stops.
-3. If upstream changed anything under `.github/`, stops and reports
+2. If upstream is already merged, stops (and closes a sync PR left over from
+   before). If upstream does not contain the upstream commit merged last, for
+   example a backport release marked latest or a force-pushed branch, stops and
+   reports `diverged`.
+3. If upstream changed anything under `.github/` (in a conflict, also any
+   workflow your fork changed, since upstream's version then lands on the sync
+   branch), stops and reports
    `workflow-review` (unless the manifest says otherwise; see
    [Trust model](#trust-model)). You review those changes, then run the
    workflow with `allow-workflow-changes`.
@@ -44,11 +49,14 @@ On each run, `fork-kit sync`:
    - **Conflicts:** the sync branch becomes upstream plus an empty marker commit, and the PR shows the conflicts.
 5. Pushes the sync branch with `--force-with-lease` (it is fork-kit's scratch
    branch, never your fork branch), opens or updates the PR, labels it, and
-   turns auto-merge on or off.
+   turns auto-merge on or off. Auto-merge names the commit fork-kit checked, so
+   GitHub refuses it if someone pushed since; if the PR can already merge,
+   fork-kit merges it directly.
 
-fork-kit recognises its own commit exactly: its trailer, its committer, its
-parents and the tree it would build. Anything else on the sync branch is
-someone else's work, for example a conflict resolution. fork-kit then leaves
+fork-kit recognises its own commit exactly: its trailer naming upstream's
+commit, its committer, its parents and the tree it would build. The guard also
+counts any push to the sync PR by someone other than the PR's author (the App)
+as someone else's work, for example a conflict resolution. fork-kit then leaves
 the branch alone:
 
 - `guard` turns auto-merge off and labels the PR `fork-kit:needs-owner`.
@@ -58,7 +66,9 @@ the branch alone:
 Auto-merge is requested only when all of these hold:
 
 - the merge has no conflicts;
-- upstream changed nothing under `.github/`;
+- upstream changed nothing under `.github/`, or the manifest says
+  `workflow_changes = "push"`;
+- nobody else pushed to the sync branch;
 - your fork branch's checks and commit statuses are not failing and could be read;
 - the PR has no `fork-kit:hold` label;
 - the manifest allows it.
@@ -171,7 +181,7 @@ files.
   Squash or rebase would throw away upstream's history.
 - A **ruleset** on your fork branch: require a pull request, require your test
   and build checks and `fork-kit/hold`, block force pushes and deletions.
-  Without required checks, auto-merge would merge immediately. Add
+  Without required checks, a clean sync PR merges at once. Add
   `fork-kit/hold` only once the guard from the template runs on the fork
   branch; until then nothing sets it and no PR could merge.
 
@@ -262,6 +272,7 @@ workflow uploads as the artifact `fork-kit-result`):
 - `up-to-date`, `clean` or `conflict`;
 - `hands-off`: a human owns the sync branch;
 - `workflow-review`: upstream changed `.github/` and nothing was pushed;
+- `diverged`: upstream does not contain the upstream commit merged last; nothing was pushed;
 - `not-sync-pr`: guard only, the PR is not the sync PR.
 
 `sync_branch.state` is one of:
@@ -282,6 +293,11 @@ workflow uploads as the artifact `fork-kit-result`):
   auto-merge is on, and the required checks finish before the guard has run.
   Add the `fork-kit:hold` label before you push to rule this out: with
   `fork-kit/hold` required, the PR cannot merge while it is held.
+- **Both jobs must agree on fork-kit's identity.** The guard recognises
+  fork-kit's commits by their committer, so give the sync and guard jobs the
+  same `git-user-name` and `git-user-email` (the defaults do).
+- **The guard fails closed.** If it cannot resolve upstream or read the sync
+  branch, it turns auto-merge off and the job fails.
 
 ## Prior art
 

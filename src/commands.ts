@@ -18,7 +18,7 @@ import type { Manifest } from "./manifest.ts";
 import { type Conflict, identity, type Outcome, type Plan, plan, type SyncState, TRAILER } from "./plan.ts";
 import { githubSlug, globMatch, md, patchesFor } from "./text.ts";
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.3.1";
 export const SCHEMA = 1;
 const MARKER = "<!-- fork-kit -->";
 
@@ -127,14 +127,37 @@ function prBody(m: Manifest, p: Plan, baseline: CheckState, automerge: boolean, 
   return `${lines.join("\n")}\n`;
 }
 
+/** Auto-merge off, or fail: reporting it off while GitHub keeps it on would merge unchecked work. */
+async function automergeOff(forge: Forge, num: number): Promise<void> {
+  const err = await forge.automerge(num, false);
+  if (err) throw new Failure(`could not turn auto-merge off on #${num}: ${err}`);
+}
+
 export async function sync(m: Manifest, forge: Forge, opts: Options): Promise<Result> {
   const p = await plan(m, forge);
   const result = reportBase("sync", m, p);
   if (p.outcome === "up-to-date") {
     result.notes.push("upstream is already merged");
+    const open = await forge.findPr(m.syncBranch, m.branch);
+    if (open && p.syncState !== "foreign" && !opts.dryRun) {
+      await forge.close(
+        open.number,
+        `${p.upstreamRef} (\`${p.upstreamSha.slice(0, 8)}\`) is already merged into \`${m.branch}\`; closing this sync PR.`,
+      );
+      result.notes.push(`closed #${open.number}: ${m.branch} already has this upstream`);
+    }
     return result;
   }
   let pr = await forge.findPr(m.syncBranch, m.branch);
+
+  if (p.outcome === "diverged") {
+    if (pr) {
+      result.pr = prRef(pr);
+      if (pr.automerge && !opts.dryRun) await automergeOff(forge, pr.number);
+    }
+    result.automerge = false;
+    return result;
+  }
 
   if (p.outcome === "hands-off") {
     if (pr === null) {
@@ -160,7 +183,7 @@ export async function sync(m: Manifest, forge: Forge, opts: Options): Promise<Re
         }
       }
       if (!opts.dryRun) {
-        if (pr.automerge) await forge.automerge(pr.number, false);
+        if (pr.automerge) await automergeOff(forge, pr.number);
         if (!pr.labels.includes(LABEL_OWNER)) await forge.labels(pr.number, [LABEL_OWNER], []);
       }
       return result;
@@ -181,8 +204,11 @@ export async function sync(m: Manifest, forge: Forge, opts: Options): Promise<Re
   const whyNot: string[] = [];
   if (!m.automerge) whyNot.push("disabled in the manifest");
   if (pr?.labels.includes(LABEL_HOLD)) whyNot.push(`held with the ${LABEL_HOLD} label`);
+  if (pr?.labels.includes(LABEL_OWNER)) whyNot.push(`marked ${LABEL_OWNER}`);
   if (p.conflicts.length) whyNot.push("merge conflicts");
-  if (p.workflowChanges.length) whyNot.push("upstream changed .github/");
+  // With workflow_changes = "push" the manifest accepts upstream's workflows unreviewed; with "hold" a human
+  // allowed this push, and merges once they are done.
+  if (p.workflowChanges.length && m.workflowChanges === "hold") whyNot.push("upstream changed .github/");
   if (baseline === "failure") whyNot.push(`\`${m.branch}\` itself is failing its checks`);
   if (baseline === "error") whyNot.push(`could not read the checks of \`${m.branch}\``);
   const automerge = whyNot.length === 0;
@@ -193,8 +219,10 @@ export async function sync(m: Manifest, forge: Forge, opts: Options): Promise<Re
     return result;
   }
 
+  let head = p.syncSha ?? "";
   if (!syncCurrent(p)) {
     const commit = buildSyncCommit(m, p);
+    head = commit;
     const lease = `--force-with-lease=refs/heads/${m.syncBranch}:${p.syncSha ?? ""}`;
     git(["push", "--quiet", lease, "origin", `${commit}:refs/heads/${m.syncBranch}`]);
     if (result.sync_branch) Object.assign(result.sync_branch, { sha: commit, state: "pure" });
@@ -216,20 +244,30 @@ export async function sync(m: Manifest, forge: Forge, opts: Options): Promise<Re
     want.filter(([l, on]) => on && !labels.includes(l)).map(([l]) => l),
     want.filter(([l, on]) => !on && labels.includes(l)).map(([l]) => l),
   );
-  if (pr.automerge !== automerge) {
-    const err = await forge.automerge(pr.number, automerge);
-    if (err) {
-      result.automerge = pr.automerge;
-      result.notes.push(`could not ${automerge ? "enable" : "disable"} auto-merge: ${err}`);
+  if (!automerge && pr.automerge) await automergeOff(forge, pr.number);
+  if (automerge && !pr.automerge) {
+    // Names the commit fork-kit checked: GitHub refuses if someone pushed since.
+    const err = await forge.automerge(pr.number, true, head);
+    if (err && /\b(clean|unstable) status\b/i.test(err)) {
+      // The required checks have passed already, so auto-merge has nothing to wait for: merge now.
+      const mergeErr = await forge.merge(pr.number, head);
+      if (mergeErr) result.notes.push(`could not merge: ${mergeErr}`);
+      else result.notes.push(`merged #${pr.number}: its required checks had passed`);
+      result.automerge = mergeErr === null;
+    } else if (err) {
+      result.automerge = false;
+      result.notes.push(`could not enable auto-merge: ${err}`);
     }
   }
   result.pr = prRef(pr);
   return result;
 }
 
-/** On pushes to the sync PR: if anyone but fork-kit pushed, switch auto-merge off and keep out. */
 /** The pull request a pull_request(_target) event is about, from the event payload. */
 interface EventPr {
+  action: string;
+  sender: string;
+  author: string;
   number: number;
   headSha: string;
   headRef: string;
@@ -252,7 +290,12 @@ export function eventPr(path = process.env.GITHUB_EVENT_PATH): EventPr | null {
   const base = (pr.base ?? {}) as { ref?: unknown };
   if (typeof head.sha !== "string" || typeof head.ref !== "string" || typeof base.ref !== "string") return null;
   const labels = Array.isArray(pr.labels) ? pr.labels : [];
+  const e = event as { action?: unknown; sender?: { login?: unknown } };
+  const user = (pr.user ?? {}) as { login?: unknown };
   return {
+    action: typeof e.action === "string" ? e.action : "",
+    sender: typeof e.sender?.login === "string" ? e.sender.login : "",
+    author: typeof user.login === "string" ? user.login : "",
     number: pr.number,
     headSha: head.sha,
     headRef: head.ref,
@@ -279,7 +322,7 @@ export async function guard(m: Manifest, forge: Forge, opts: Options): Promise<R
         held ? "failure" : "success",
         held ? `Held: remove the ${LABEL_HOLD} label to merge` : `Not held (add ${LABEL_HOLD} to hold)`,
       );
-      if (held && event.automerge) await forge.automerge(event.number, false);
+      if (held && event.automerge) await automergeOff(forge, event.number);
     }
     notes.push(
       held
@@ -301,7 +344,35 @@ export async function guard(m: Manifest, forge: Forge, opts: Options): Promise<R
       notes: [...notes, `${headRef} is not ${m.syncBranch}`],
     };
   }
-  const p = await plan(m, forge);
+  // fork-kit opens the sync PR and is the only one meant to push to it. A push by anyone else is someone
+  // else's work, whatever its commits claim, and needs no upstream to tell.
+  if (event && event.action === "synchronize" && event.author && event.sender !== event.author) {
+    const pr = await forge.findPr(m.syncBranch, m.branch);
+    if (pr && !opts.dryRun) {
+      if (pr.automerge) await automergeOff(forge, pr.number);
+      if (!pr.labels.includes(LABEL_OWNER)) await forge.labels(pr.number, [LABEL_OWNER], []);
+    }
+    return {
+      schema: SCHEMA,
+      tool: `fork-kit ${VERSION}`,
+      command: "guard",
+      outcome: "hands-off",
+      conflicts: [],
+      workflow_changes: [],
+      pr: pr ? prRef(pr) : null,
+      automerge: false,
+      notes: [...notes, `${event.sender} pushed to the sync PR, which ${event.author} opened: auto-merge off`],
+    };
+  }
+  let p: Plan;
+  try {
+    p = await plan(m, forge);
+  } catch (e) {
+    // Fail closed: without a plan the guard cannot tell fork-kit's commit from someone else's.
+    const pr = await forge.findPr(m.syncBranch, m.branch);
+    if (pr?.automerge && !opts.dryRun) await automergeOff(forge, pr.number);
+    throw e;
+  }
   const result = reportBase("guard", m, p);
   result.notes.push(...notes);
   const pr = await forge.findPr(m.syncBranch, m.branch);
@@ -317,7 +388,7 @@ export async function guard(m: Manifest, forge: Forge, opts: Options): Promise<R
   }
   Object.assign(result, { outcome: "hands-off", automerge: false });
   if (!opts.dryRun) {
-    if (pr.automerge) await forge.automerge(pr.number, false);
+    if (pr.automerge) await automergeOff(forge, pr.number);
     if (!pr.labels.includes(LABEL_OWNER)) await forge.labels(pr.number, [LABEL_OWNER], []);
   }
   result.notes.push("someone else pushed to the sync branch: auto-merge off");
@@ -351,6 +422,12 @@ export async function resolve(m: Manifest, forge: Forge): Promise<Result> {
   const p = await plan(m, forge);
   const result = reportBase("resolve", m, p);
   if (p.syncSha === null) throw new Failure(`origin has no ${m.syncBranch}; run fork-kit sync first`);
+  const local = `refs/heads/${m.syncBranch}`;
+  if (gitOk(["rev-parse", "--verify", "--quiet", local]) && git(["rev-list", "-n", "1", local, `^${p.syncSha}`])) {
+    throw new Failure(
+      `your local ${m.syncBranch} has commits that are not on origin's; push them (git push origin HEAD:${local}) or delete the branch first`,
+    );
+  }
   git(["checkout", "--quiet", "-B", m.syncBranch, p.syncSha]);
   const merged = spawnSync("git", ["merge", "--no-ff", "--no-edit", p.forkSha], { encoding: "utf8" });
   if (merged.status === 0) {
