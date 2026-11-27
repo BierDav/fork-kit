@@ -7,7 +7,7 @@ have (yet). Every upstream change then has to be merged in, tested, and
 released, and every so often a merge conflicts or a patch stops working.
 fork-kit makes that the same routine for every fork:
 
-- A scheduled job merges the newest upstream (a branch, the newest matching
+- A sync job merges the newest upstream (a branch, the newest matching
   tag, or the latest GitHub release) into a sync branch and keeps one pull
   request open for it.
 - Your fork's CI and upstream's CI run on that PR. A clean merge with green
@@ -191,7 +191,15 @@ Copy [`examples/fork-kit.yml`](examples/fork-kit.yml) (or, with a
 [central sync](#central-sync-one-key-for-every-fork),
 [`examples/fork-kit-guard.yml`](examples/fork-kit-guard.yml)) to
 `.github/workflows/fork-kit.yml`, set your fork branch, and pin `BierDav/fork-kit` to a
-commit SHA. Your existing test, build and release workflows stay as they are.
+commit SHA. The example dispatches on the fork's default branch.
+[Prism workers](https://github.com/BierDav/prism/blob/main/docs/worker.md#fork-kit-upstream-checks)
+can poll for upstream changes and dispatch this workflow directly in each fork.
+The dispatch credential only needs Actions access; the App credentials stay in
+the fork's `fork-kit` environment, restricted to its exact default branch.
+If the default branch differs from the fork branch, put the dispatch workflow
+on the default branch and keep the guard on the fork branch.
+
+Your existing test, build and release workflows stay as they are.
 Make sure they run:
 
 - on `pull_request` into the fork branch: tests and build, no publishing;
@@ -199,12 +207,11 @@ Make sure they run:
 
 ### Central sync: one key for every fork
 
-Instead of a sync job and an App key in every fork, one workflow can sync all
-of them. [`.github/workflows/sync-forks.yml`](.github/workflows/sync-forks.yml)
-runs on a schedule in a repository of your own (this one, for BierDav's forks),
-lists the repositories the App is installed on, and runs `fork-kit sync` for
-each one that has `.fork-kit.toml` on its default branch, with an installation
-token limited to that fork.
+A central workflow is an alternative to direct dispatch when you keep the
+App key out of the forks. [`.github/workflows/sync-forks.yml`](.github/workflows/sync-forks.yml)
+lists the repositories the App is installed on and runs `fork-kit sync` for
+each selected fork with a manifest on its default branch, using an installation
+token limited to that fork. Leave `repository` blank to sync every fork manually.
 
 - The App key exists once, as `FORK_KIT_APP_KEY` in that repository's
   `fork-kit` environment (deployment branches: the default branch only), with
